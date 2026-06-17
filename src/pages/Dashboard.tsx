@@ -1,4 +1,4 @@
-import { Shield, Wifi, Clock, TrendingDown, Zap, AlertTriangle } from "lucide-react"
+import { Shield, Wifi, TrendingDown, Zap, AlertTriangle, AlertCircle } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
@@ -66,21 +66,22 @@ function DataBudgetRing({
   )
 }
 
-const RECENT_EVENTS = [
-  { time: "14:32:01", event: "Blocked: Windows Update (Background)", type: "blocked" },
-  { time: "14:31:48", event: "Allowed: DNS resolution", type: "allowed" },
-  { time: "14:30:12", event: "Blocked: OneDrive sync attempt", type: "blocked" },
-  { time: "14:28:55", event: "Blocked: Chrome auto-update", type: "blocked" },
-  { time: "14:27:03", event: "Shield activated", type: "info" },
-]
-
 export function Dashboard() {
-  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, lastHotspotDetected, firewallStatus } =
+  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes } =
     useShield()
 
   const pct = Math.round((dataBudgetUsed / dataBudgetTotal) * 100)
   const remaining = dataBudgetTotal - dataBudgetUsed
-  const savedMB = 318
+  const savedMB = Math.max(0, dataBudgetTotal - dataBudgetUsed)
+
+  const activeProcesses = processes.filter((p) => p.status === "active").length
+  const totalProcesses = processes.length
+
+  const recentEvents = processes.slice(0, 5).map((p) => ({
+    time: p.lastSeen === "now" ? "now" : p.lastSeen,
+    event: `${p.status === "blocked" ? "Blocked" : "Active"}: ${p.name}`,
+    type: p.status === "blocked" ? "blocked" as const : p.status === "active" ? "allowed" as const : "info" as const,
+  }))
 
   return (
     <div className="p-6 space-y-6">
@@ -175,40 +176,60 @@ export function Dashboard() {
                 </p>
               </div>
               <div className="text-right shrink-0">
-                <p className="text-xs text-muted-foreground">Blocked today</p>
+                <p className="text-xs text-muted-foreground">Blocked</p>
                 <p className={cn("text-lg font-bold tabular-nums", isShieldActive ? "text-neon-emerald" : "text-foreground")}>
-                  47
+                  {blockedCount}
                 </p>
               </div>
             </CardContent>
           </Card>
 
-          {/* Hotspot Detection */}
-          <Card className="border-border bg-card">
+          {/* WFP Status */}
+          <Card className={cn(
+            "border transition-all duration-300",
+            wfpAvailable
+              ? "border-neon-cyan/20 bg-neon-cyan/5"
+              : "border-amber-500/20 bg-amber-500/5"
+          )}>
             <CardContent className="flex items-center gap-4 py-4 px-5">
-              <div className="flex size-11 shrink-0 items-center justify-center rounded-xl border border-neon-cyan/30 bg-neon-cyan/10">
-                <Wifi className="size-5 text-neon-cyan" />
+              <div className={cn(
+                "flex size-11 shrink-0 items-center justify-center rounded-xl border",
+                wfpAvailable
+                  ? "border-neon-cyan/30 bg-neon-cyan/10"
+                  : "border-amber-500/30 bg-amber-500/10"
+              )}>
+                {wfpAvailable ? (
+                  <Wifi className="size-5 text-neon-cyan" />
+                ) : (
+                  <AlertCircle className="size-5 text-amber-400" />
+                )}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-0.5">
-                  <p className="text-sm font-semibold text-foreground">Hotspot Detection</p>
+                  <p className="text-sm font-semibold text-foreground">WFP Engine</p>
                   <Badge
                     variant="outline"
-                    className="border-neon-cyan/30 text-neon-cyan bg-neon-cyan/5 text-[10px] h-4 px-1.5 tracking-wider uppercase"
+                    className={cn(
+                      "text-[10px] h-4 px-1.5 tracking-wider uppercase",
+                      wfpAvailable
+                        ? "border-neon-cyan/30 text-neon-cyan bg-neon-cyan/5"
+                        : "border-amber-500/30 text-amber-400 bg-amber-500/5"
+                    )}
                   >
-                    Detected
+                    {wfpAvailable ? "Active" : "Unavailable"}
                   </Badge>
                 </div>
                 <p className="text-xs text-muted-foreground truncate">
-                  Metered connection identified — Auto-shield triggered
+                  {wfpAvailable
+                    ? "Windows Filtering Platform driver engaged"
+                    : "WFP not available on this platform"}
                 </p>
               </div>
               <div className="text-right shrink-0">
-                <div className="flex items-center gap-1 justify-end text-muted-foreground mb-0.5">
-                  <Clock className="size-3" />
-                  <span className="text-[10px]">Last seen</span>
-                </div>
-                <p className="text-sm font-semibold text-foreground">{lastHotspotDetected}</p>
+                <p className="text-xs text-muted-foreground">Processes</p>
+                <p className={cn("text-lg font-bold tabular-nums", wfpAvailable ? "text-neon-cyan" : "text-foreground")}>
+                  {totalProcesses}
+                </p>
               </div>
             </CardContent>
           </Card>
@@ -216,9 +237,9 @@ export function Dashboard() {
           {/* Stats row */}
           <div className="col-span-2 grid grid-cols-3 gap-3">
             {[
-              { icon: Zap, label: "Avg. Block Rate", value: "94%", sub: "last 7 days", color: "text-neon-emerald" },
-              { icon: TrendingDown, label: "Data Saved (Week)", value: "2.1 GB", sub: "vs no shield", color: "text-neon-cyan" },
-              { icon: AlertTriangle, label: "Threats Detected", value: "128", sub: "this month", color: "text-amber-400" },
+              { icon: Zap, label: "Active Processes", value: activeProcesses.toString(), sub: "currently active", color: "text-neon-emerald" },
+              { icon: TrendingDown, label: "Session Data", value: `${dataBudgetUsed.toFixed(1)} MB`, sub: "this session", color: "text-neon-cyan" },
+              { icon: AlertTriangle, label: "Blocked Apps", value: blockedApps.length.toString(), sub: "rules active", color: "text-amber-400" },
             ].map(({ icon: Icon, label, value, sub, color }) => (
               <Card key={label} className="border-border bg-card">
                 <CardContent className="flex items-center gap-3 py-3 px-4">
@@ -240,16 +261,16 @@ export function Dashboard() {
         <CardHeader className="pb-3 border-b border-border">
           <div className="flex items-center justify-between">
             <CardTitle className="text-sm font-medium text-foreground">
-              Recent Activity
+              Network Activity
             </CardTitle>
             <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-medium">
-              Live Feed
+              {processes.length} Processes
             </span>
           </div>
         </CardHeader>
         <CardContent className="pt-3 p-0">
           <div className="font-mono text-xs divide-y divide-border">
-            {RECENT_EVENTS.map((ev, i) => (
+            {recentEvents.length > 0 ? recentEvents.map((ev, i) => (
               <div
                 key={i}
                 className="flex items-center gap-4 px-5 py-2.5 hover:bg-accent/30 transition-colors"
@@ -271,7 +292,11 @@ export function Dashboard() {
                 </span>
                 <span className="text-muted-foreground truncate">{ev.event}</span>
               </div>
-            ))}
+            )) : (
+              <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
+                No network activity detected
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>

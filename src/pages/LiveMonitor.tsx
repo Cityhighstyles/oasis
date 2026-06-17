@@ -1,25 +1,11 @@
 import { useState, useEffect } from "react"
-import { invoke } from "@tauri-apps/api/core";
-import { Search, RefreshCw, ChevronUp, ChevronDown } from "lucide-react"
+import { Search, RefreshCw, ChevronUp, ChevronDown, Shield, ShieldOff } from "lucide-react"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
-import { useShield } from "@/context/ShieldContext"
+import { useShield, type ProcessStatus, type ProcessEntry } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
-
-type ProcessStatus = "blocked" | "active" | "monitoring"
-
-type ProcessEntry = {
-  pid: number
-  name: string
-  exe: string
-  status: ProcessStatus
-  sessionData: number
-  totalData: number
-  connections: number
-  lastSeen: string
-}
 
 const STATUS_CONFIG: Record<
   ProcessStatus,
@@ -49,29 +35,30 @@ type SortKey = "name" | "status" | "sessionData" | "totalData" | "connections"
 type SortDir = "asc" | "desc"
 
 export function LiveMonitor() {
-  const { isShieldActive } = useShield()
-  const [processes, setProcesses] = useState<ProcessEntry[]>([])
+  const { isShieldActive, processes, blockApp, unblockApp, refreshProcesses, wfpAvailable } = useShield()
   const [loading, setLoading] = useState<boolean>(true)
   const [search, setSearch] = useState("")
   const [sortField, setSortField] = useState<SortKey>("sessionData")
   const [sortOrder, setSortOrder] = useState<SortDir>("desc")
   const [tick, setTick] = useState(0)
+  const [actionInProgress, setActionInProgress] = useState<string | null>(null)
 
-  const updateSystemMatrix = async () => {
+  const handleToggleBlock = async (proc: ProcessEntry) => {
+    setActionInProgress(proc.exe)
     try {
-      const liveData: ProcessEntry[] = await invoke("get_live_processes")
-      setProcesses(liveData)
-    } catch (err) {
-      console.error("Failed to read system process space registry:", err)
+      if (proc.status === "blocked") {
+        await unblockApp(proc.exe)
+      } else {
+        await blockApp(proc.exe)
+      }
     } finally {
-      setLoading(false)
+      setActionInProgress(null)
     }
   }
 
   useEffect(() => {
-    updateSystemMatrix()
+    setLoading(false)
     const threadTick = setInterval(() => {
-      updateSystemMatrix()
       setTick((t) => t + 1)
     }, 2000)
     return () => clearInterval(threadTick)
@@ -171,11 +158,11 @@ export function LiveMonitor() {
               variant="outline"
               size="sm"
               className="h-8 gap-1.5 text-xs border-border hover:bg-accent"
-              onClick={updateSystemMatrix}
+              onClick={refreshProcesses}
               disabled={loading}
             >
               <RefreshCw className="size-3" />
-              Reset
+              Refresh
             </Button>
             <Badge
               variant="outline"
@@ -194,7 +181,7 @@ export function LiveMonitor() {
 
         <CardContent className="p-0">
           {/* Table header */}
-          <div className="grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_1fr] gap-0 border-b border-border bg-muted/20 px-5 py-2">
+          <div className="grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_1fr_80px] gap-0 border-b border-border bg-muted/20 px-5 py-2">
             {(
               [
                 { key: "name" as SortKey, label: "Process" },
@@ -203,6 +190,7 @@ export function LiveMonitor() {
                 { key: "sessionData" as SortKey, label: "Session" },
                 { key: "totalData" as SortKey, label: "Total" },
                 { key: null, label: "Last Active" },
+                { key: null, label: "Action" },
               ] as { key: SortKey | null; label: string }[]
             ).map(({ key, label }) => (
               <button
@@ -224,11 +212,13 @@ export function LiveMonitor() {
           <div className="divide-y divide-border font-mono text-xs">
             {filtered.map((proc) => {
               const s = STATUS_CONFIG[proc.status]
+              const isBlocked = proc.status === "blocked"
+              const isOperating = actionInProgress === proc.exe
               return (
                 <div
                   key={proc.pid}
                   className={cn(
-                    "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_1fr] gap-0 px-5 py-3 transition-colors",
+                    "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_1fr_80px] gap-0 px-5 py-3 transition-colors",
                     s.row
                   )}
                 >
@@ -292,6 +282,31 @@ export function LiveMonitor() {
                   >
                     {proc.lastSeen}
                   </span>
+
+                  {/* Action button */}
+                  <div className="self-center flex justify-center">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className={cn(
+                        "h-6 w-6 p-0",
+                        isBlocked
+                          ? "text-neon-emerald hover:text-neon-emerald hover:bg-neon-emerald/10"
+                          : "text-destructive hover:text-destructive hover:bg-destructive/10"
+                      )}
+                      onClick={() => handleToggleBlock(proc)}
+                      disabled={!wfpAvailable || isOperating}
+                      title={isBlocked ? "Unblock this process" : "Block this process"}
+                    >
+                      {isOperating ? (
+                        <RefreshCw className="size-3 animate-spin" />
+                      ) : isBlocked ? (
+                        <ShieldOff className="size-3" />
+                      ) : (
+                        <Shield className="size-3" />
+                      )}
+                    </Button>
+                  </div>
                 </div>
               )
             })}
