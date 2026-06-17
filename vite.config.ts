@@ -11,6 +11,7 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+<<<<<<< HEAD
   // Tauri-specific configurations
   server: {
     port: 5173,
@@ -21,3 +22,6 @@ export default defineConfig({
     },
   },
 })
+=======
+})
+>>>>>>> 2579928da3c7226ec8c9bb63ace4249848a1f5b0
