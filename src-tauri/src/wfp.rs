@@ -9,7 +9,7 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
+    FwpmEngineClose0, FwpmFilterAdd0, FwpmFilterDeleteById0,
     FwpmFreeMemory0, FwpmGetAppIdFromFileName0, FwpmSubLayerAdd0,
     FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
     FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0,
@@ -19,6 +19,17 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_CONDITION_ALE_APP_ID, FWPM_ACTION0, FWP_VALUE0,
 };
 use windows_sys::core::{GUID, PCWSTR};
+
+// Manual FFI binding for FwpmEngineOpen0 (missing from windows-sys)
+extern "system" {
+    pub fn FwpmEngineOpen0(
+        serverName: PCWSTR,
+        authnService: u32,
+        authIdentity: *const c_void,
+        session: *const FWPM_SESSION0,
+        engineHandle: *mut HANDLE,
+    ) -> u32;
+}
 
 // RPC_C_AUTHN_DEFAULT = 0xFFFFFFFF: use current-user credentials.
 const RPC_C_AUTHN_DEFAULT: u32 = 0xFFFF_FFFF;
@@ -201,9 +212,7 @@ fn add_app_filter(
     condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
     condition.matchType = FWP_MATCH_EQUAL;
     condition.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
-    unsafe {
-        condition.conditionValue.Anonymous.byteBlob = &mut blob as *mut FWP_BYTE_BLOB;
-    }
+    condition.conditionValue.Anonymous.byteBlob = &mut blob as *mut FWP_BYTE_BLOB;
 
     // Wide display name — must outlive FwpmFilterAdd0.
     let desc_wide: Vec<u16> = description

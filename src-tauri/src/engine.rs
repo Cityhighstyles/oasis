@@ -62,9 +62,12 @@ mod stub {
     pub mod iphelper {
         use std::collections::HashMap;
         use super::ProcessNetStats;
-        pub fn collect_tcp_stats() -> HashMap<u32, ProcessNetStats> { HashMap::new() }
         pub fn collect_udp_counts(_: &mut HashMap<u32, ProcessNetStats>) {}
     }
+
+    // collect_tcp_connection_stats() intentionally omitted — the entire
+    // TCP delta block in poll() is #[cfg(windows)], so this module only
+    // needs the UDP stub for the shared code path.
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -120,6 +123,8 @@ pub struct NetworkEngine {
     entries: Vec<ProcessEntry>,
     /// Historical accumulators keyed by *lowercase exe path*.
     accumulators: HashMap<String, ProcessAccumulator>,
+    #[cfg(target_os = "windows")]
+    last_seen_connections: HashMap<iphelper::ConnectionKey, (u64, u64)>,
 }
 
 impl NetworkEngine {
@@ -128,6 +133,8 @@ impl NetworkEngine {
             wfp: WfpEngine::new(),
             entries: Vec::new(),
             accumulators: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            last_seen_connections: HashMap::new(),
         }
     }
 
@@ -150,8 +157,43 @@ impl NetworkEngine {
     pub fn poll(&mut self) {
         let now = Local::now().format("%H:%M:%S").to_string();
 
-        // 1. Collect TCP stats (byte counts + connection counts)
-        let mut stats_map = iphelper::collect_tcp_stats();
+        // 1. Collect TCP stats (byte counts + connection counts) via connection deltas
+        let mut stats_map: HashMap<u32, ProcessNetStats> = HashMap::new();
+
+        #[cfg(target_os = "windows")]
+        let mut current_connections: HashMap<iphelper::ConnectionKey, (u64, u64)> =
+            HashMap::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            for conn in iphelper::collect_tcp_connection_stats() {
+                let prev_counters = self
+                    .last_seen_connections
+                    .get(&conn.key)
+                    .unwrap_or(&(0, 0));
+
+                let delta_in = conn.bytes_in.saturating_sub(prev_counters.0);
+                let delta_out = conn.bytes_out.saturating_sub(prev_counters.1);
+
+                let entry = stats_map.entry(conn.pid).or_insert_with(|| ProcessNetStats {
+                    pid: conn.pid,
+                    exe_path: conn.exe_path.clone(),
+                    ..Default::default()
+                });
+
+                entry.bytes_in += delta_in;
+                entry.bytes_out += delta_out;
+                entry.tcp_connections += 1;
+                current_connections.insert(conn.key, (conn.bytes_in, conn.bytes_out));
+            }
+
+            self.last_seen_connections = current_connections;
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = &stats_map;
+        }
 
         // 2. Add UDP connection counts to the same map
         iphelper::collect_udp_counts(&mut stats_map);

@@ -46,35 +46,63 @@ pub struct ProcessNetStats {
     pub udp_connections: usize,
 }
 
+#[derive(Hash, Eq, PartialEq, Clone)]
+pub struct ConnectionKey {
+    pub local_addr: u32,
+    pub local_port: u32,
+    pub remote_addr: u32,
+    pub remote_port: u32,
+}
+/// Per-TCP-connection snapshot of EStats counters and owning PID.
+pub struct TcpConnectionStats {
+    pub pid: u32,
+    pub exe_path: String,
+    pub key: ConnectionKey,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
 // ──────────────────────────── public functions ───────────────────────────────
 
-/// Enumerate all active IPv4 TCP connections and aggregate byte stats per PID.
-pub fn collect_tcp_stats() -> HashMap<u32, ProcessNetStats> {
-    let mut result: HashMap<u32, ProcessNetStats> = HashMap::new();
-
+/// Enumerate all active IPv4 TCP connections and return per-connection EStats counters.
+pub fn collect_tcp_connection_stats() -> Vec<TcpConnectionStats> {
     let rows = match get_tcp_table_rows() {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("collect_tcp_stats: {e}");
-            return result;
+            log::warn!("collect_tcp_connection_stats: {e}");
+            return Vec::new();
         }
     };
+
+    let mut exe_path_cache: HashMap<u32, String> = HashMap::new();
+    let mut result: Vec<TcpConnectionStats> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         let pid = row.dwOwningPid;
         if pid <= 4 { continue; }
 
-        let entry = result.entry(pid).or_insert_with(|| {
-            let exe_path = resolve_process_path(pid).unwrap_or_default();
-            ProcessNetStats { pid, exe_path, ..Default::default() }
-        });
-        entry.tcp_connections += 1;
+        let exe_path = exe_path_cache
+            .entry(pid)
+            .or_insert_with(|| resolve_process_path(pid).unwrap_or_default())
+            .clone();
+
+        let key = ConnectionKey {
+            local_addr: row.dwLocalAddr,
+            local_port: row.dwLocalPort,
+            remote_addr: row.dwRemoteAddr,
+            remote_port: row.dwRemotePort,
+        };
 
         let mib = to_mib_tcprow_lh(row);
         enable_estats(&mib);
         if let Some(rod) = read_estats(&mib) {
-            entry.bytes_in = entry.bytes_in.saturating_add(rod.DataBytesIn);
-            entry.bytes_out = entry.bytes_out.saturating_add(rod.DataBytesOut);
+            result.push(TcpConnectionStats {
+                pid,
+                exe_path,
+                key,
+                bytes_in: rod.DataBytesIn,
+                bytes_out: rod.DataBytesOut,
+            });
         }
     }
 
@@ -201,9 +229,9 @@ fn to_mib_tcprow_lh(src: &MIB_TCPROW_OWNER_PID) -> MIB_TCPROW_LH {
 }
 
 /// Enable EStats data collection for one TCP connection.
-/// `TCP_ESTATS_DATA_RW_v0::EnableCollection` is `BOOLEAN` = u8 (not bool).
+/// `TCP_ESTATS_DATA_RW_v0::EnableCollection` is now `bool` in windows-sys 0.61+.
 fn enable_estats(row: &MIB_TCPROW_LH) {
-    let rw = TCP_ESTATS_DATA_RW_v0 { EnableCollection: 1u8 };
+    let rw = TCP_ESTATS_DATA_RW_v0 { EnableCollection: true };
     unsafe {
         SetPerTcpConnectionEStats(
             row as *const MIB_TCPROW_LH,
