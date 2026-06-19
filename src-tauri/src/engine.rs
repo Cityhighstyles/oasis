@@ -89,10 +89,8 @@ pub struct ProcessEntry {
     pub exe: String,
     /// "blocked" | "active" | "monitoring"
     pub status: String,
-    /// MB transferred during this app session (TCP only, from EStats).
+    /// MB transferred during this app session (cumulative, TCP only, from EStats).
     pub session_data: f64,
-    /// Historical cumulative MB (persisted across polling ticks).
-    pub total_data: f64,
     /// TCP + UDP socket count from the current snapshot.
     pub connections: usize,
     /// "now" while active, or last HH:MM:SS timestamp when dormant.
@@ -113,6 +111,8 @@ struct ProcessAccumulator {
     last_bytes_out: u64,
     /// Last display name resolved for this exe.
     display_name: String,
+    /// Original (non-lowercased) exe path for accurate display.
+    original_exe_path: String,
     /// Last time we saw this process active (used for last_seen field).
     last_seen: String,
 }
@@ -215,11 +215,13 @@ impl NetworkEngine {
                 .entry(exe_key.clone())
                 .or_insert_with(|| ProcessAccumulator {
                     display_name: display_name.clone(),
+                    original_exe_path: net_stats.exe_path.clone(),
                     last_seen: now.clone(),
                     ..Default::default()
                 });
 
             acc.display_name = display_name.clone();
+            acc.original_exe_path = net_stats.exe_path.clone();
 
             // Delta bytes since last tick (EStats resets on connection open,
             // so we guard against negative deltas by clamping to 0).
@@ -231,9 +233,7 @@ impl NetworkEngine {
             acc.last_bytes_out = net_stats.bytes_out;
             acc.last_seen = now.clone();
 
-            let session_bytes = acc.cumulative_in + acc.cumulative_out;
-            let session_mb = round2(bytes_to_mb(session_bytes));
-            let total_mb = round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out));
+            let session_mb = round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out));
 
             let status = if is_blocked {
                 "blocked"
@@ -249,7 +249,6 @@ impl NetworkEngine {
                 exe: net_stats.exe_path.clone(),
                 status: status.to_string(),
                 session_data: session_mb,
-                total_data: total_mb,
                 connections,
                 last_seen: if status == "active" {
                     "now".to_string()
@@ -274,14 +273,20 @@ impl NetworkEngine {
                     .map(|e| e.pid)
                     .unwrap_or(0);
 
-                let total_mb = round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out));
+                let session_mb = round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out));
+                // Use the stored original exe path for accurate casing,
+                // falling back to the lowercased key if not available.
+                let exe_display = if acc.original_exe_path.is_empty() {
+                    exe_key.clone()
+                } else {
+                    acc.original_exe_path.clone()
+                };
                 new_entries.push(ProcessEntry {
                     pid: prev_pid,
                     name: acc.display_name.clone(),
-                    exe: exe_key.clone(),
+                    exe: exe_display,
                     status: "monitoring".to_string(),
-                    session_data: round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out)),
-                    total_data: total_mb,
+                    session_data: session_mb,
                     connections: 0,
                     last_seen: acc.last_seen.clone(),
                 });

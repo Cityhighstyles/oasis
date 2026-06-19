@@ -31,7 +31,7 @@ const STATUS_CONFIG: Record<
   },
 }
 
-type SortKey = "name" | "status" | "sessionData" | "totalData" | "connections"
+type SortKey = "name" | "status" | "sessionData" | "connections"
 type SortDir = "asc" | "desc"
 
 export function LiveMonitor() {
@@ -40,7 +40,6 @@ export function LiveMonitor() {
   const [search, setSearch] = useState("")
   const [sortField, setSortField] = useState<SortKey>("sessionData")
   const [sortOrder, setSortOrder] = useState<SortDir>("desc")
-  const [tick, setTick] = useState(0)
   const [actionInProgress, setActionInProgress] = useState<string | null>(null)
 
   const handleToggleBlock = async (proc: ProcessEntry) => {
@@ -58,10 +57,6 @@ export function LiveMonitor() {
 
   useEffect(() => {
     setLoading(false)
-    const threadTick = setInterval(() => {
-      setTick((t) => t + 1)
-    }, 2000)
-    return () => clearInterval(threadTick)
   }, [])
 
   const handleSort = (key: SortKey) => {
@@ -85,7 +80,6 @@ export function LiveMonitor() {
       if (sortField === "name") cmp = a.name.localeCompare(b.name)
       else if (sortField === "status") cmp = a.status.localeCompare(b.status)
       else if (sortField === "sessionData") cmp = a.sessionData - b.sessionData
-      else if (sortField === "totalData") cmp = a.totalData - b.totalData
       else if (sortField === "connections") cmp = a.connections - b.connections
       return sortOrder === "asc" ? cmp : -cmp
     })
@@ -116,7 +110,7 @@ export function LiveMonitor() {
         </div>
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/60 font-mono">
           <div className="size-1.5 rounded-full bg-neon-emerald animate-pulse" />
-          LIVE — tick #{tick.toString().padStart(4, "0")}
+          LIVE
         </div>
       </div>
 
@@ -181,14 +175,13 @@ export function LiveMonitor() {
 
         <CardContent className="p-0">
           {/* Table header */}
-          <div className="grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_1fr_80px] gap-0 border-b border-border bg-muted/20 px-5 py-2">
+          <div className="grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_80px] gap-0 border-b border-border bg-muted/20 px-5 py-2">
             {(
               [
                 { key: "name" as SortKey, label: "Process" },
                 { key: null, label: "Executable" },
                 { key: "status" as SortKey, label: "Status" },
-                { key: "sessionData" as SortKey, label: "Session" },
-                { key: "totalData" as SortKey, label: "Total" },
+                { key: "sessionData" as SortKey, label: "Data Usage" },
                 { key: null, label: "Last Active" },
                 { key: null, label: "Action" },
               ] as { key: SortKey | null; label: string }[]
@@ -214,14 +207,13 @@ export function LiveMonitor() {
               const s = STATUS_CONFIG[proc.status]
               const isBlocked = proc.status === "blocked"
               const isOperating = actionInProgress === proc.exe
-              return (
-                <div
-                  key={proc.pid}
-                  className={cn(
-                    "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_1fr_80px] gap-0 px-5 py-3 transition-colors",
-                    s.row
-                  )}
-                >
+              return (                  <div
+                    key={proc.pid}
+                    className={cn(
+                      "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_80px] gap-0 px-5 py-3 transition-colors",
+                      s.row
+                    )}
+                  >
                   {/* Process name */}
                   <div className="flex items-center gap-2 min-w-0">
                     <span
@@ -256,7 +248,7 @@ export function LiveMonitor() {
                     </Badge>
                   </div>
 
-                  {/* Session */}
+                  {/* Session data usage */}
                   <span
                     className={cn(
                       "self-center tabular-nums font-medium",
@@ -264,11 +256,6 @@ export function LiveMonitor() {
                     )}
                   >
                     {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
-                  </span>
-
-                  {/* Total */}
-                  <span className="self-center text-muted-foreground tabular-nums">
-                    {proc.totalData} MB
                   </span>
 
                   {/* Last active */}
