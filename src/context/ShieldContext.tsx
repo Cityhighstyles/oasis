@@ -22,6 +22,7 @@ type ShieldContextType = {
   firewallStatus: "active" | "inactive" | "partial"
   wfpAvailable: boolean
   processes: ProcessEntry[]
+  blockedApps: ProcessEntry[]
   blockApp: (exePath: string) => Promise<void>
   unblockApp: (exePath: string) => Promise<void>
   refreshProcesses: () => Promise<void>
@@ -98,6 +99,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   }, [refreshWfpStatus, refreshProcesses])
 
   const blockedCount = processes.filter((p) => p.status === "blocked").length
+  const blockedApps = processes.filter((p) => p.status === "blocked")
 
   return (
     <ShieldContext.Provider
@@ -110,6 +112,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         firewallStatus,
         wfpAvailable,
         processes,
+        blockedApps,
         blockApp,
         unblockApp,
         refreshProcesses,
