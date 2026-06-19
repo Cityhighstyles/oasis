@@ -1,10 +1,42 @@
-import { useState, useEffect } from "react"
-import { Search, RefreshCw, ChevronUp, ChevronDown, Shield, ShieldOff } from "lucide-react"
+import { useState, useEffect, useMemo, useCallback, useRef } from "react"
+import {
+  Search,
+  RefreshCw,
+  ChevronUp,
+  ChevronDown,
+  ChevronRight,
+  Shield,
+  ShieldOff,
+  MoreVertical,
+  PauseCircle,
+  PlayCircle,
+  Trash2,
+  ShieldBan,
+} from "lucide-react"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { useShield, type ProcessStatus, type ProcessEntry } from "@/context/ShieldContext"
+import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 
 const STATUS_CONFIG: Record<
@@ -34,26 +66,447 @@ const STATUS_CONFIG: Record<
 type SortKey = "name" | "status" | "sessionData" | "connections"
 type SortDir = "asc" | "desc"
 
+type ProcessGroup = {
+  key: string
+  exe: string
+  name: string
+  processes: ProcessEntry[]
+  totalSessionData: number
+  totalConnections: number
+  pidCount: number
+  status: ProcessStatus
+  lastSeen: string
+}
+
+function groupProcesses(entries: ProcessEntry[]): ProcessGroup[] {
+  const map = new Map<string, ProcessGroup>()
+
+  for (const proc of entries) {
+    const key = proc.exe.toLowerCase()
+    const existing = map.get(key)
+
+    if (existing) {
+      existing.processes.push(proc)
+      existing.totalSessionData += proc.sessionData
+      existing.totalConnections += proc.connections
+      existing.pidCount++
+      // Status priority: blocked > active > monitoring
+      if (proc.status === "blocked") {
+        existing.status = "blocked"
+      } else if (proc.status === "active" && existing.status !== "blocked") {
+        existing.status = "active"
+      }
+      if (proc.lastSeen === "now") {
+        existing.lastSeen = "now"
+      }
+    } else {
+      map.set(key, {
+        key,
+        exe: proc.exe,
+        name: proc.name,
+        processes: [proc],
+        totalSessionData: proc.sessionData,
+        totalConnections: proc.connections,
+        pidCount: 1,
+        status: proc.status,
+        lastSeen: proc.lastSeen,
+      })
+    }
+  }
+
+  return Array.from(map.values())
+}
+
+type StatusBadgeProps = {
+  status: ProcessStatus
+  className?: string
+}
+
+function StatusBadge({ status, className }: StatusBadgeProps) {
+  const s = STATUS_CONFIG[status]
+  return (
+    <Badge
+      variant="outline"
+      className={cn("text-[10px] px-1.5 h-4 tracking-wider", s.badge, className)}
+    >
+      {s.label}
+    </Badge>
+  )
+}
+
+type ProcessRowProps = {
+  proc: ProcessEntry
+  isOperating: string | null
+  onToggleBlock: (proc: ProcessEntry) => void
+  wfpAvailable: boolean
+  isSuspended: boolean
+  onSuspend: (pid: number) => void
+  onResume: (pid: number) => void
+  onKill: (pid: number, name: string) => void
+  isLocked: boolean
+}
+
+function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended, onSuspend, onResume, onKill, isLocked }: ProcessRowProps) {
+  const s = STATUS_CONFIG[proc.status]
+  const isBlocked = proc.status === "blocked"
+  const isOperatingNow = isOperating === proc.exe
+
+  return (
+    <div
+      className={cn(
+        "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_80px] gap-0 px-5 py-2 transition-colors",
+        s.row
+      )}
+    >
+      {/* Process name — indented with PID info */}
+      <div className="flex items-center gap-2 min-w-0 pl-8">
+        <span
+          className={cn(
+            "size-1 shrink-0 rounded-full",
+            isSuspended ? "bg-amber-400" : s.dot,
+            proc.status === "active" && !isSuspended && "animate-pulse"
+          )}
+        />
+        <div className="min-w-0">
+          <span className="text-muted-foreground/70 text-[10px] font-mono">
+            PID {proc.pid}
+          </span>
+          {isSuspended && (
+            <span className="text-amber-400/70 text-[9px] font-mono ml-1.5">
+              (suspended)
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Exe */}
+      <span className="text-muted-foreground/40 self-center truncate text-[10px] pr-2">
+        {proc.exe}
+      </span>
+
+      {/* Status */}
+      <div className="self-center">
+        {isSuspended ? (
+          <Badge
+            variant="outline"
+            className="text-[10px] px-1.5 h-4 tracking-wider border-amber-500/30 text-amber-400 bg-amber-500/5"
+          >
+            SUSPENDED
+          </Badge>
+        ) : (
+          <StatusBadge status={proc.status} />
+        )}
+      </div>
+
+      {/* Session data usage */}
+      <span
+        className={cn(
+          "self-center tabular-nums font-medium text-[11px]",
+          proc.sessionData > 0 ? "text-foreground/70" : "text-muted-foreground/40"
+        )}
+      >
+        {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
+      </span>
+
+      {/* Last active */}
+      <span
+        className={cn(
+          "self-center text-[11px]",
+          proc.lastSeen === "now"
+            ? "text-neon-emerald/70"
+            : "text-muted-foreground/40"
+        )}
+      >
+        {proc.lastSeen === "now" ? "now" : proc.lastSeen}
+      </span>
+
+      {/* Action dropdown */}
+      <div className="self-center flex justify-center">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 p-0 text-muted-foreground/50 hover:text-foreground hover:bg-accent/50"
+              disabled={isLocked || (!wfpAvailable && !isSuspended)}
+            >
+              {isLocked ? (
+                <RefreshCw className="size-3 animate-spin text-muted-foreground/50" />
+              ) : (
+                <MoreVertical className="size-3" />
+              )}
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-[160px]">
+            {/* Block / Unblock */}
+            <DropdownMenuItem
+              onClick={() => onToggleBlock(proc)}
+              disabled={isLocked || !wfpAvailable}
+              className="gap-2"
+            >
+              {isBlocked ? (
+                <ShieldOff className="size-3.5 text-neon-emerald" />
+              ) : (
+                <ShieldBan className="size-3.5 text-destructive" />
+              )}
+              <span>{isBlocked ? "Unblock Network" : "Block Network"}</span>
+            </DropdownMenuItem>
+
+            {/* Suspend / Resume */}
+            <DropdownMenuItem
+              onClick={() => isSuspended ? onResume(proc.pid) : onSuspend(proc.pid)}
+              disabled={isLocked}
+              className="gap-2"
+            >
+              {isSuspended ? (
+                <PlayCircle className="size-3.5 text-neon-emerald" />
+              ) : (
+                <PauseCircle className="size-3.5 text-amber-400" />
+              )}
+              <span>{isSuspended ? "Resume Process" : "Suspend Process"}</span>
+            </DropdownMenuItem>
+
+            <DropdownMenuSeparator />
+
+            {/* Kill */}
+            <DropdownMenuItem
+              onClick={() => onKill(proc.pid, proc.name)}
+              disabled={isLocked}
+              variant="destructive"
+              className="gap-2"
+            >
+              <Trash2 className="size-3.5" />
+              <span>Kill Process</span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
+  )
+}
+
+// ──────────────────────────── main component ─────────────────────────
+
 export function LiveMonitor() {
-  const { isShieldActive, processes, blockApp, unblockApp, refreshProcesses, wfpAvailable } = useShield()
+  const { isShieldActive, processes, blockApp, unblockApp, refreshProcesses, wfpAvailable, suspendProcess, resumeProcess, killProcess, suspendedPids } = useShield()
   const [loading, setLoading] = useState<boolean>(true)
   const [search, setSearch] = useState("")
   const [sortField, setSortField] = useState<SortKey>("sessionData")
   const [sortOrder, setSortOrder] = useState<SortDir>("desc")
   const [actionInProgress, setActionInProgress] = useState<string | null>(null)
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
+  const [killConfirm, setKillConfirm] = useState<{ pid: number; name: string } | null>(null)
+  const processingLock = useRef(false)
+
+  /// Wrap an async action with a global lock to prevent concurrent IPC calls.
+  const withLock = useCallback(
+    <T>(fn: () => Promise<T>): Promise<T> | undefined => {
+      if (processingLock.current) return undefined
+      processingLock.current = true
+      return fn().finally(() => {
+        processingLock.current = false
+      })
+    },
+    []
+  )
 
   const handleToggleBlock = async (proc: ProcessEntry) => {
-    setActionInProgress(proc.exe)
-    try {
-      if (proc.status === "blocked") {
-        await unblockApp(proc.exe)
-      } else {
-        await blockApp(proc.exe)
+    const result = withLock(async () => {
+      setActionInProgress(proc.exe)
+      try {
+        if (proc.status === "blocked") {
+          await unblockApp(proc.exe)
+          toast.success("Network unblocked", {
+            description: `${proc.name} can now access the network`,
+          })
+        } else {
+          await blockApp(proc.exe)
+          toast.success("Network blocked", {
+            description: `${proc.name} has been blocked from the network`,
+          })
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Action failed", {
+          description: `Failed to ${proc.status === "blocked" ? "unblock" : "block"} ${proc.name}: ${msg}`,
+        })
+      } finally {
+        setActionInProgress(null)
       }
-    } finally {
-      setActionInProgress(null)
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
     }
   }
+
+  const handleGroupToggleBlock = async (group: ProcessGroup) => {
+    const result = withLock(async () => {
+      const isBlocked = group.status === "blocked"
+      setActionInProgress(group.exe)
+      try {
+        if (isBlocked) {
+          await unblockApp(group.exe)
+          toast.success("Network unblocked", {
+            description: `${group.name} (${group.pidCount} ${
+              group.pidCount === 1 ? "PID" : "PIDs"
+            }) can now access the network`,
+          })
+        } else {
+          await blockApp(group.exe)
+          toast.success("Network blocked", {
+            description: `${group.name} (${group.pidCount} ${
+              group.pidCount === 1 ? "PID" : "PIDs"
+            }) has been blocked from the network`,
+          })
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Action failed", {
+          description: `Failed to ${isBlocked ? "unblock" : "block"} ${group.name}: ${msg}`,
+        })
+      } finally {
+        setActionInProgress(null)
+      }
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
+    }
+  }
+
+  const toggleGroup = useCallback((key: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) {
+        next.delete(key)
+      } else {
+        next.add(key)
+      }
+      return next
+    })
+  }, [])
+
+  const handleSuspend = useCallback(async (pid: number) => {
+    const result = withLock(async () => {
+      setActionInProgress(`suspend:${pid}`)
+      try {
+        const count = await suspendProcess(pid)
+        toast.success("Process suspended", {
+          description: `PID ${pid} — ${count} thread${count === 1 ? "" : "s"} paused`,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Suspend failed", {
+          description: msg,
+        })
+      } finally {
+        setActionInProgress(null)
+      }
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
+    }
+  }, [suspendProcess, withLock])
+
+  const handleResume = useCallback(async (pid: number) => {
+    const result = withLock(async () => {
+      setActionInProgress(`resume:${pid}`)
+      try {
+        const count = await resumeProcess(pid)
+        toast.success("Process resumed", {
+          description: `PID ${pid} — ${count} thread${count === 1 ? "" : "s"} resumed`,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Resume failed", {
+          description: msg,
+        })
+      } finally {
+        setActionInProgress(null)
+      }
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
+    }
+  }, [resumeProcess, withLock])
+
+  const handleKill = useCallback(async (pid: number, name: string) => {
+    const result = withLock(async () => {
+      setActionInProgress(`kill:${pid}`)
+      try {
+        await killProcess(pid)
+        toast.success("Process terminated", {
+          description: `${name} (PID ${pid}) has been killed`,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Termination failed", {
+          description: msg,
+        })
+      } finally {
+        setActionInProgress(null)
+      }
+      setKillConfirm(null)
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
+    }
+  }, [killProcess, withLock])
+
+  const handleGroupSuspendAll = useCallback(async (group: ProcessGroup) => {
+    const result = withLock(async () => {
+      setActionInProgress(`suspend-group:${group.key}`)
+      let count = 0
+      try {
+        for (const proc of group.processes) {
+          if (!suspendedPids.has(proc.pid)) {
+            await suspendProcess(proc.pid)
+            count++
+          }
+        }
+        toast.success("Processes suspended", {
+          description: `${group.name} — ${count} of ${group.processes.length} PIDs paused`,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Suspend failed", {
+          description: msg,
+        })
+      } finally {
+        setActionInProgress(null)
+      }
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
+    }
+  }, [suspendProcess, suspendedPids, withLock])
+
+  const handleGroupResumeAll = useCallback(async (group: ProcessGroup) => {
+    const result = withLock(async () => {
+      setActionInProgress(`resume-group:${group.key}`)
+      let count = 0
+      try {
+        for (const proc of group.processes) {
+          if (suspendedPids.has(proc.pid)) {
+            await resumeProcess(proc.pid)
+            count++
+          }
+        }
+        toast.success("Processes resumed", {
+          description: `${group.name} — ${count} of ${group.processes.length} PIDs resumed`,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        toast.error("Resume failed", {
+          description: msg,
+        })
+      } finally {
+        setActionInProgress(null)
+      }
+    })
+    if (result === undefined) {
+      toast.info("Please wait", { description: "Another action is still in progress." })
+    }
+  }, [resumeProcess, suspendedPids, withLock])
 
   useEffect(() => {
     setLoading(false)
@@ -68,24 +521,41 @@ export function LiveMonitor() {
     }
   }
 
-  const filtered = processes
-    .filter((p) => {
+  // Filter, group, and sort
+  const { groups, blocked, active } = useMemo(() => {
+    const lowerSearch = search.toLowerCase()
+    const filtered = processes.filter((p) => {
       return (
-        p.name.toLowerCase().includes(search.toLowerCase()) ||
-        p.exe.toLowerCase().includes(search.toLowerCase())
+        p.name.toLowerCase().includes(lowerSearch) ||
+        p.exe.toLowerCase().includes(lowerSearch)
       )
     })
-    .sort((a, b) => {
+
+    const grouped = groupProcesses(filtered)
+
+    grouped.sort((a, b) => {
       let cmp = 0
       if (sortField === "name") cmp = a.name.localeCompare(b.name)
       else if (sortField === "status") cmp = a.status.localeCompare(b.status)
-      else if (sortField === "sessionData") cmp = a.sessionData - b.sessionData
-      else if (sortField === "connections") cmp = a.connections - b.connections
+      else if (sortField === "sessionData") cmp = a.totalSessionData - b.totalSessionData
+      else if (sortField === "connections") cmp = a.totalConnections - b.totalConnections
       return sortOrder === "asc" ? cmp : -cmp
     })
 
-  const blocked = processes.filter((p) => p.status === "blocked").length
-  const active = processes.filter((p) => p.status === "active").length
+    // Sort PIDs within each group by PID ascending
+    for (const group of grouped) {
+      group.processes.sort((a, b) => a.pid - b.pid)
+    }
+
+    const blockedCount = processes.filter((p) => p.status === "blocked").length
+    const activeCount = processes.filter((p) => p.status === "active").length
+
+    return {
+      groups: grouped,
+      blocked: blockedCount,
+      active: activeCount,
+    }
+  }, [processes, search, sortField, sortOrder])
 
   function SortIcon({ k }: { k: SortKey }) {
     if (sortField !== k)
@@ -105,7 +575,7 @@ export function LiveMonitor() {
             Live Network Monitor
           </h1>
           <p className="text-sm text-muted-foreground mt-0.5">
-            Real-time view of processes and network activity
+            Real-time view of processes grouped by application
           </p>
         </div>
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/60 font-mono">
@@ -117,9 +587,9 @@ export function LiveMonitor() {
       {/* Stats bar */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: "Total Processes", value: processes.length, color: "text-foreground" },
-          { label: "Blocked", value: blocked, color: "text-destructive" },
+          { label: "Applications", value: groups.length, color: "text-foreground" },
           { label: "Active", value: active, color: "text-neon-emerald" },
+          { label: "Blocked", value: blocked, color: "text-destructive" },
           {
             label: "Session Usage",
             value: `${processes.reduce((s, p) => s + p.sessionData, 0).toFixed(1)} MB`,
@@ -167,7 +637,12 @@ export function LiveMonitor() {
                   : "border-border text-muted-foreground"
               )}
             >
-              <span className={cn("size-1.5 rounded-full", isShieldActive ? "bg-neon-emerald" : "bg-muted-foreground")} />
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  isShieldActive ? "bg-neon-emerald" : "bg-muted-foreground"
+                )}
+              />
               {isShieldActive ? "Shield Active" : "Shield Off"}
             </Badge>
           </div>
@@ -178,7 +653,7 @@ export function LiveMonitor() {
           <div className="grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_80px] gap-0 border-b border-border bg-muted/20 px-5 py-2">
             {(
               [
-                { key: "name" as SortKey, label: "Process" },
+                { key: "name" as SortKey, label: "Application" },
                 { key: null, label: "Executable" },
                 { key: "status" as SortKey, label: "Status" },
                 { key: "sessionData" as SortKey, label: "Data Usage" },
@@ -201,111 +676,230 @@ export function LiveMonitor() {
             ))}
           </div>
 
-          {/* Rows */}
+          {/* Grouped rows */}
           <div className="divide-y divide-border font-mono text-xs">
-            {filtered.map((proc) => {
-              const s = STATUS_CONFIG[proc.status]
-              const isBlocked = proc.status === "blocked"
-              const isOperating = actionInProgress === proc.exe
-              return (                  <div
-                    key={proc.pid}
-                    className={cn(
-                      "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_80px] gap-0 px-5 py-3 transition-colors",
-                      s.row
-                    )}
-                  >
-                  {/* Process name */}
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span
+            {groups.map((group) => {
+              const s = STATUS_CONFIG[group.status]
+              const isBlocked = group.status === "blocked"
+              const isExpanded = expandedGroups.has(group.key)
+              const isOperating = actionInProgress === group.exe
+              const groupAllSuspended = group.processes.every((p) =>
+                suspendedPids.has(p.pid)
+              )
+              const isSuspendOperating =
+                actionInProgress === `suspend-group:${group.key}` ||
+                actionInProgress === `resume-group:${group.key}`
+
+              return (
+                <Collapsible
+                  key={group.key}
+                  open={isExpanded}
+                  onOpenChange={() => toggleGroup(group.key)}
+                >
+                  {/* Group header row */}
+                  <CollapsibleTrigger asChild>
+                    <div
                       className={cn(
-                        "size-1.5 shrink-0 rounded-full",
-                        s.dot,
-                        proc.status === "active" && "animate-pulse"
+                        "grid grid-cols-[2fr_1.5fr_1fr_1fr_1fr_80px] gap-0 px-5 py-3 transition-colors cursor-pointer select-none",
+                        s.row
                       )}
-                    />
-                    <div className="min-w-0">
-                      <span className="text-foreground font-medium truncate block">
-                        {proc.name}
+                    >
+                      {/* Process name + PID count */}
+                      <div className="flex items-center gap-2 min-w-0">
+                        <ChevronRight
+                          className={cn(
+                            "size-3 shrink-0 text-muted-foreground/50 transition-transform duration-200",
+                            isExpanded && "rotate-90"
+                          )}
+                        />
+                        <span
+                          className={cn(
+                            "size-1.5 shrink-0 rounded-full",
+                            s.dot,
+                            group.status === "active" && "animate-pulse"
+                          )}
+                        />
+                        <div className="min-w-0">
+                          <span className="text-foreground font-medium truncate block">
+                            {group.name}
+                          </span>
+                          <span className="text-muted-foreground/50 text-[10px]">
+                            {group.pidCount} {group.pidCount === 1 ? "PID" : "PIDs"}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Exe */}
+                      <span className="text-muted-foreground self-center truncate pr-2">
+                        {group.exe}
                       </span>
-                      <span className="text-muted-foreground/50 text-[10px]">
-                        PID {proc.pid}
+
+                      {/* Status */}
+                      <div className="self-center">
+                        <StatusBadge status={group.status} />
+                      </div>
+
+                      {/* Session data usage (aggregate) */}
+                      <span
+                        className={cn(
+                          "self-center tabular-nums font-medium",
+                          group.totalSessionData > 0
+                            ? "text-foreground"
+                            : "text-muted-foreground/40"
+                        )}
+                      >
+                        {group.totalSessionData > 0
+                          ? `${group.totalSessionData} MB`
+                          : "—"}
                       </span>
+
+                      {/* Last active */}
+                      <span
+                        className={cn(
+                          "self-center",
+                          group.lastSeen === "now"
+                            ? "text-neon-emerald"
+                            : "text-muted-foreground/50"
+                        )}
+                      >
+                        {group.lastSeen === "now"
+                          ? "now"
+                          : group.lastSeen}
+                      </span>
+
+                      {/* Action button (group-level) */}
+                      <div className="self-center flex justify-center gap-1">
+                        {/* Suspend / Resume all */}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={cn(
+                            "h-6 w-6 p-0",
+                            groupAllSuspended
+                              ? "text-neon-emerald hover:text-neon-emerald hover:bg-neon-emerald/10"
+                              : "text-amber-400 hover:text-amber-400 hover:bg-amber-400/10"
+                          )}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (groupAllSuspended) {
+                              handleGroupResumeAll(group)
+                            } else {
+                              handleGroupSuspendAll(group)
+                            }
+                          }}
+                          disabled={isSuspendOperating}
+                          title={
+                            groupAllSuspended
+                              ? "Resume all processes"
+                              : "Suspend all processes"
+                          }
+                        >
+                          {isSuspendOperating ? (
+                            <RefreshCw className="size-3 animate-spin" />
+                          ) : groupAllSuspended ? (
+                            <PlayCircle className="size-3" />
+                          ) : (
+                            <PauseCircle className="size-3" />
+                          )}
+                        </Button>
+
+                        {/* Block / Unblock all */}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={cn(
+                            "h-6 w-6 p-0",
+                            isBlocked
+                              ? "text-neon-emerald hover:text-neon-emerald hover:bg-neon-emerald/10"
+                              : "text-destructive hover:text-destructive hover:bg-destructive/10"
+                          )}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleGroupToggleBlock(group)
+                          }}
+                          disabled={!wfpAvailable || isOperating}
+                          title={
+                            isBlocked
+                              ? "Unblock all processes"
+                              : "Block all processes"
+                          }
+                        >
+                          {isOperating ? (
+                            <RefreshCw className="size-3 animate-spin" />
+                          ) : isBlocked ? (
+                            <ShieldOff className="size-3" />
+                          ) : (
+                            <Shield className="size-3" />
+                          )}
+                        </Button>
+                      </div>
                     </div>
-                  </div>
+                  </CollapsibleTrigger>
 
-                  {/* Exe */}
-                  <span className="text-muted-foreground self-center truncate pr-2">
-                    {proc.exe}
-                  </span>
-
-                  {/* Status */}
-                  <div className="self-center">
-                    <Badge
-                      variant="outline"
-                      className={cn("text-[10px] px-1.5 h-4 tracking-wider", s.badge)}
-                    >
-                      {s.label}
-                    </Badge>
-                  </div>
-
-                  {/* Session data usage */}
-                  <span
-                    className={cn(
-                      "self-center tabular-nums font-medium",
-                      proc.sessionData > 0 ? "text-foreground" : "text-muted-foreground/40"
-                    )}
-                  >
-                    {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
-                  </span>
-
-                  {/* Last active */}
-                  <span
-                    className={cn(
-                      "self-center",
-                      proc.lastSeen === "now"
-                        ? "text-neon-emerald"
-                        : "text-muted-foreground/50"
-                    )}
-                  >
-                    {proc.lastSeen}
-                  </span>
-
-                  {/* Action button */}
-                  <div className="self-center flex justify-center">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className={cn(
-                        "h-6 w-6 p-0",
-                        isBlocked
-                          ? "text-neon-emerald hover:text-neon-emerald hover:bg-neon-emerald/10"
-                          : "text-destructive hover:text-destructive hover:bg-destructive/10"
-                      )}
-                      onClick={() => handleToggleBlock(proc)}
-                      disabled={!wfpAvailable || isOperating}
-                      title={isBlocked ? "Unblock this process" : "Block this process"}
-                    >
-                      {isOperating ? (
-                        <RefreshCw className="size-3 animate-spin" />
-                      ) : isBlocked ? (
-                        <ShieldOff className="size-3" />
-                      ) : (
-                        <Shield className="size-3" />
-                      )}
-                    </Button>
-                  </div>
-                </div>
+                  {/* Expanded PID sub-rows */}
+                  <CollapsibleContent>
+                    <div className="divide-y divide-border/50">
+                      {group.processes.map((proc) => (
+                        <PidSubRow
+                          key={proc.pid}
+                          proc={proc}
+                          isOperating={actionInProgress}
+                          onToggleBlock={handleToggleBlock}
+                          wfpAvailable={wfpAvailable}
+                          isSuspended={suspendedPids.has(proc.pid)}
+                          onSuspend={handleSuspend}
+                          onResume={handleResume}
+                          onKill={(pid, name) => setKillConfirm({ pid, name })}
+                        />
+                      ))}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
               )
             })}
           </div>
 
-          {filtered.length === 0 && (
+          {groups.length === 0 && (
             <div className="flex items-center justify-center py-12 text-muted-foreground text-sm">
-              No processes match your filter
+              {processes.length === 0
+                ? "No network activity detected"
+                : "No processes match your filter"}
             </div>
           )}
         </CardContent>
       </Card>
+
+      {/* Kill confirmation dialog */}
+      <AlertDialog
+        open={killConfirm !== null}
+        onOpenChange={(open) => !open && setKillConfirm(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Kill Process</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to terminate{" "}
+              <span className="font-semibold text-foreground">
+                {killConfirm?.name ?? "this process"}
+              </span>{" "}
+              (PID {killConfirm?.pid})? This action cannot be undone. The
+              process will be forcefully terminated.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() =>
+                killConfirm &&
+                handleKill(killConfirm.pid, killConfirm.name)
+              }
+            >
+              Kill Process
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

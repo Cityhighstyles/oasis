@@ -81,7 +81,7 @@ pub struct ProcessEntry {
     pub exe: String,
     /// "blocked" | "active" | "monitoring"
     pub status: String,
-    /// MB transferred during this app session (cumulative, TCP only, from EStats).
+    /// MB transferred during this app session (cumulative, all protocols via IO counters).
     pub session_data: f64,
     /// TCP + UDP socket count from the current snapshot.
     pub connections: usize,
@@ -90,21 +90,15 @@ pub struct ProcessEntry {
 }
 // ────────────────────────────── engine state ─────────────────────────────────
 
-/// Persisted per-process accounting that survives across polling ticks.
+/// Persisted per-exe-path metadata that survives across polling ticks.
+/// No longer tracks bytes — cumulative IO is tracked per-PID in `per_pid_cumulative`.
 #[derive(Clone, Debug, Default)]
 struct ProcessAccumulator {
-    /// Cumulative bytes received over the session lifetime (TCP EStats delta sum).
-    cumulative_in: u64,
-    /// Cumulative bytes sent over the session lifetime.
-    cumulative_out: u64,
-    /// Last EStats snapshot — needed to compute the delta between ticks.
-    last_bytes_in: u64,
-    last_bytes_out: u64,
     /// Last display name resolved for this exe.
     display_name: String,
     /// Original (non-lowercased) exe path for accurate display.
     original_exe_path: String,
-    /// Last time we saw this process active (used for last_seen field).
+    /// Last time we saw this exe actively (used for last_seen field).
     last_seen: String,
 }
 
@@ -112,10 +106,16 @@ pub struct NetworkEngine {
     pub wfp: WfpEngine,
     /// Latest snapshot of process entries (replaced atomically each tick).
     entries: Vec<ProcessEntry>,
-    /// Historical accumulators keyed by *lowercase exe path*.
+    /// Historical per-exe-path metadata for dormant process preservation.
     accumulators: HashMap<String, ProcessAccumulator>,
+    /// Cumulative IO_COUNTERS.OtherTransferCount per PID (total since first seen).
+    per_pid_cumulative: HashMap<u32, u64>,
+    /// Previous IO_COUNTERS.OtherTransferCount per PID, used to compute byte deltas.
     #[cfg(target_os = "windows")]
-    last_seen_connections: HashMap<iphelper::ConnectionKey, (u64, u64)>,
+    last_io_other_bytes: HashMap<u32, u64>,
+    /// Set of PIDs that have been suspended by the user.
+    #[cfg(target_os = "windows")]
+    pub suspended_pids: std::collections::HashSet<u32>,
 }
 
 impl NetworkEngine {
@@ -124,8 +124,11 @@ impl NetworkEngine {
             wfp: WfpEngine::new(),
             entries: Vec::new(),
             accumulators: HashMap::new(),
+            per_pid_cumulative: HashMap::new(),
             #[cfg(target_os = "windows")]
-            last_seen_connections: HashMap::new(),
+            last_io_other_bytes: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            suspended_pids: std::collections::HashSet::new(),
         }
     }
 
@@ -148,37 +151,31 @@ impl NetworkEngine {
     pub fn poll(&mut self) {
         let now = Local::now().format("%H:%M:%S").to_string();
 
-        // 1. Collect TCP stats (byte counts + connection counts) via connection deltas
+        // 1. Collect connection counts for ALL protocols.
+        //    Byte tracking uses GetProcessIoCounters (covers TCP+UDP+IPv4+IPv6).
         let mut stats_map: HashMap<u32, ProcessNetStats> = HashMap::new();
 
-        #[cfg(target_os = "windows")]
-        let mut current_connections: HashMap<iphelper::ConnectionKey, (u64, u64)> =
-            HashMap::new();
-
+        // 1a. TCP IPv4 connections (for connection count only — EStats bytes not used)
         #[cfg(target_os = "windows")]
         {
             for conn in iphelper::collect_tcp_connection_stats() {
-                let prev_counters = self
-                    .last_seen_connections
-                    .get(&conn.key)
-                    .unwrap_or(&(0, 0));
-
-                let delta_in = conn.bytes_in.saturating_sub(prev_counters.0);
-                let delta_out = conn.bytes_out.saturating_sub(prev_counters.1);
-
                 let entry = stats_map.entry(conn.pid).or_insert_with(|| ProcessNetStats {
                     pid: conn.pid,
                     exe_path: conn.exe_path.clone(),
                     ..Default::default()
                 });
-
-                entry.bytes_in += delta_in;
-                entry.bytes_out += delta_out;
                 entry.tcp_connections += 1;
-                current_connections.insert(conn.key, (conn.bytes_in, conn.bytes_out));
             }
 
-            self.last_seen_connections = current_connections;
+            // 1b. TCP IPv6 connections (for connection count only)
+            for (pid, exe_path) in iphelper::collect_tcp6_connection_stats() {
+                let entry = stats_map.entry(pid).or_insert_with(|| ProcessNetStats {
+                    pid,
+                    exe_path,
+                    ..Default::default()
+                });
+                entry.tcp_connections += 1;
+            }
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -189,7 +186,35 @@ impl NetworkEngine {
         // 2. Add UDP connection counts to the same map
         iphelper::collect_udp_counts(&mut stats_map);
 
-        // 3. Build entries
+        // 3. Query IO_COUNTERS.OtherTransferCount for per-process byte tracking.
+        //    This captures all socket I/O (TCP + UDP + IPv4 + IPv6) as a cumulative
+        //    counter from process start. We compute a delta from the previous poll
+        //    value and store it in bytes_in as a per-tick delta.
+        #[cfg(target_os = "windows")]
+        {
+            let pids: Vec<u32> = stats_map.keys().copied().collect();
+            for pid in &pids {
+                if let Some(current_other) = iphelper::get_process_other_bytes(*pid) {
+                    let prev = self.last_io_other_bytes.get(pid).copied();
+                    let delta = match prev {
+                        // Already seen this PID — compute bytes since last poll
+                        Some(p) => current_other.saturating_sub(p),
+                        // First time — skip historical bytes, just set baseline
+                        None => 0,
+                    };
+                    if let Some(entry) = stats_map.get_mut(pid) {
+                        entry.bytes_in = delta;
+                        entry.bytes_out = 0;
+                    }
+                    self.last_io_other_bytes.insert(*pid, current_other);
+
+                    // Track per-PID cumulative bytes (independent of exe_path)
+                    *self.per_pid_cumulative.entry(*pid).or_insert(0) += delta;
+                }
+            }
+        }
+
+        // 4. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
         let mut new_entries: Vec<ProcessEntry> = Vec::with_capacity(stats_map.len());
 
         for (pid, net_stats) in &stats_map {
@@ -197,10 +222,9 @@ impl NetworkEngine {
             let is_blocked = self.wfp.is_blocked(&net_stats.exe_path);
             let connections = net_stats.tcp_connections + net_stats.udp_connections;
 
-            // Determine display name from exe path
             let display_name = display_name_for(&net_stats.exe_path);
 
-            // Accumulate bytes using delta computation
+            // Update accumulator metadata for dormant preservation (no byte tracking here)
             let acc = self
                 .accumulators
                 .entry(exe_key.clone())
@@ -208,23 +232,15 @@ impl NetworkEngine {
                     display_name: display_name.clone(),
                     original_exe_path: net_stats.exe_path.clone(),
                     last_seen: now.clone(),
-                    ..Default::default()
                 });
 
             acc.display_name = display_name.clone();
             acc.original_exe_path = net_stats.exe_path.clone();
-
-            // Delta bytes since last tick (EStats resets on connection open,
-            // so we guard against negative deltas by clamping to 0).
-            let delta_in = net_stats.bytes_in.saturating_sub(acc.last_bytes_in);
-            let delta_out = net_stats.bytes_out.saturating_sub(acc.last_bytes_out);
-            acc.cumulative_in += delta_in;
-            acc.cumulative_out += delta_out;
-            acc.last_bytes_in = net_stats.bytes_in;
-            acc.last_bytes_out = net_stats.bytes_out;
             acc.last_seen = now.clone();
 
-            let session_mb = round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out));
+            // Session data from per-PID cumulative bytes (NOT shared across PIDs)
+            let pid_cumulative = self.per_pid_cumulative.get(pid).copied().unwrap_or(0);
+            let session_mb = round2(bytes_to_mb(pid_cumulative));
 
             let status = if is_blocked {
                 "blocked"
@@ -249,42 +265,52 @@ impl NetworkEngine {
             });
         }
 
-        // 4. Preserve dormant processes (were active before, not in current snapshot)
-        //    so their historical data stays visible in the UI.
+        // 5. Preserve dormant processes — only when the *specific PID* (not just exe_path)
+        //    is no longer in the current snapshot. This prevents a new PID for the same
+        //    executable from suppressing the old PID's historical entry.
         for (exe_key, acc) in &self.accumulators {
-            let still_present = stats_map.values().any(|s| {
-                s.exe_path.to_lowercase() == *exe_key
-            });
-            if !still_present && acc.cumulative_in + acc.cumulative_out > 0 {
-                // Find original entry's pid from previous entries list
-                let prev_pid = self
-                    .entries
-                    .iter()
-                    .find(|e| e.exe.to_lowercase() == *exe_key)
-                    .map(|e| e.pid)
+            // Find the PID from the previous poll's entries for this exe_path
+            let prev_entry = self
+                .entries
+                .iter()
+                .find(|e| e.exe.to_lowercase() == *exe_key);
+            let prev_pid = prev_entry.map(|e| e.pid);
+
+            // Only add dormant entry if this specific PID is NOT in the current snapshot
+            let pid_still_active = prev_pid.is_some_and(|pid| stats_map.contains_key(&pid));
+
+            if !pid_still_active {
+                let pid_cumulative = prev_pid
+                    .and_then(|pid| self.per_pid_cumulative.get(&pid))
+                    .copied()
                     .unwrap_or(0);
 
-                let session_mb = round2(bytes_to_mb(acc.cumulative_in + acc.cumulative_out));
-                // Use the stored original exe path for accurate casing,
-                // falling back to the lowercased key if not available.
-                let exe_display = if acc.original_exe_path.is_empty() {
-                    exe_key.clone()
-                } else {
-                    acc.original_exe_path.clone()
-                };
-                new_entries.push(ProcessEntry {
-                    pid: prev_pid,
-                    name: acc.display_name.clone(),
-                    exe: exe_display,
-                    status: "monitoring".to_string(),
-                    session_data: session_mb,
-                    connections: 0,
-                    last_seen: acc.last_seen.clone(),
-                });
+                if pid_cumulative > 0 {
+                    let session_mb = round2(bytes_to_mb(pid_cumulative));
+                    let exe_display = if acc.original_exe_path.is_empty() {
+                        exe_key.clone()
+                    } else {
+                        acc.original_exe_path.clone()
+                    };
+                    // Preserve the last_seen from the previous entries (frozen at dormancy)
+                    let prev_last_seen = prev_entry
+                        .map(|e| e.last_seen.clone())
+                        .unwrap_or_else(|| acc.last_seen.clone());
+
+                    new_entries.push(ProcessEntry {
+                        pid: prev_pid.unwrap_or(0),
+                        name: acc.display_name.clone(),
+                        exe: exe_display,
+                        status: "monitoring".to_string(),
+                        session_data: session_mb,
+                        connections: 0,
+                        last_seen: prev_last_seen,
+                    });
+                }
             }
         }
 
-        // 5. Sort by session data descending (highest consumers first)
+        // 6. Sort by session data descending (highest consumers first)
         new_entries.sort_by(|a, b| {
             b.session_data
                 .partial_cmp(&a.session_data)

@@ -6,6 +6,8 @@
 use std::sync::{Arc, Mutex};
 use tauri::State;
 
+#[cfg(target_os = "windows")]
+use crate::procctl;
 use crate::engine::{NetworkEngine, ProcessEntry};
 
 /// Managed state type registered with Tauri.
@@ -51,7 +53,6 @@ pub fn toggle_process_shield(
 }
 
 /// Returns whether the WFP engine session is currently open.
-/// The front-end can use this to indicate whether live blocking is available.
 #[tauri::command]
 pub fn get_wfp_status(state: State<'_, AppState>) -> bool {
     match state.0.lock() {
@@ -66,5 +67,82 @@ pub fn get_blocked_apps(state: State<'_, AppState>) -> Vec<String> {
     match state.0.lock() {
         Ok(engine) => engine.wfp.blocked_paths(),
         Err(_) => vec![],
+    }
+}
+
+/// Suspend all threads of a process by PID.
+#[tauri::command]
+pub fn suspend_process(
+    pid: u32,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let result = procctl::suspend_process(pid)?;
+        if let Ok(mut engine) = state.0.lock() {
+            engine.suspended_pids.insert(pid);
+        }
+        Ok(result)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&state, pid);
+        Err("Process control not available on this platform".into())
+    }
+}
+
+/// Resume all threads of a suspended process by PID.
+#[tauri::command]
+pub fn resume_process(
+    pid: u32,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let result = procctl::resume_process(pid)?;
+        if let Ok(mut engine) = state.0.lock() {
+            engine.suspended_pids.remove(&pid);
+        }
+        Ok(result)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&state, pid);
+        Err("Process control not available on this platform".into())
+    }
+}
+
+/// Forcefully terminate a process by PID.
+#[tauri::command]
+pub fn kill_process(
+    pid: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = &state;
+        procctl::kill_process(pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&state, pid);
+        Err("Process control not available on this platform".into())
+    }
+}
+
+/// Returns the set of currently-suspended PIDs.
+#[tauri::command]
+pub fn get_suspended_pids(state: State<'_, AppState>) -> Vec<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        match state.0.lock() {
+            Ok(engine) => engine.suspended_pids.iter().copied().collect(),
+            Err(_) => vec![],
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = &state;
+        vec![]
     }
 }

@@ -15,6 +15,9 @@ pub mod wfp;
 #[cfg(target_os = "windows")]
 pub mod iphelper;
 
+#[cfg(target_os = "windows")]
+pub mod procctl;
+
 pub mod engine;
 pub mod commands;
 
@@ -56,6 +59,10 @@ pub fn run() {
             commands::toggle_process_shield,
             commands::get_wfp_status,
             commands::get_blocked_apps,
+            commands::suspend_process,
+            commands::resume_process,
+            commands::kill_process,
+            commands::get_suspended_pids,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

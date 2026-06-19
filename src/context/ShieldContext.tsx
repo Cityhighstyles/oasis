@@ -27,6 +27,10 @@ type ShieldContextType = {
   unblockApp: (exePath: string) => Promise<void>
   refreshProcesses: () => Promise<void>
   blockedCount: number
+  suspendProcess: (pid: number) => Promise<number>
+  resumeProcess: (pid: number) => Promise<number>
+  killProcess: (pid: number) => Promise<void>
+  suspendedPids: Set<number>
 }
 
 const ShieldContext = createContext<ShieldContextType | null>(null)
@@ -39,6 +43,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   const [firewallStatus, setFirewallStatus] = useState<"active" | "inactive" | "partial">("inactive")
   const [wfpAvailable, setWfpAvailable] = useState(false)
   const [processes, setProcesses] = useState<ProcessEntry[]>([])
+  const [suspendedPids, setSuspendedPids] = useState<Set<number>>(new Set())
 
   const refreshProcesses = useCallback(async () => {
     try {
@@ -83,6 +88,32 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     }
   }, [refreshProcesses])
 
+  const refreshSuspendedPids = useCallback(async () => {
+    try {
+      const pids: number[] = await invoke("get_suspended_pids")
+      setSuspendedPids(new Set(pids))
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  const suspendProcess = useCallback(async (pid: number) => {
+    const count: number = await invoke("suspend_process", { pid })
+    await refreshSuspendedPids()
+    return count
+  }, [])
+
+  const resumeProcess = useCallback(async (pid: number) => {
+    const count: number = await invoke("resume_process", { pid })
+    await refreshSuspendedPids()
+    return count
+  }, [])
+
+  const killProcess = useCallback(async (pid: number) => {
+    await invoke("kill_process", { pid })
+    await refreshProcesses()
+  }, [refreshProcesses])
+
   const toggleShield = useCallback(() => {
     setIsShieldActive((prev) => !prev)
   }, [])
@@ -90,13 +121,14 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     refreshWfpStatus()
     refreshProcesses()
+    refreshSuspendedPids()
 
     const interval = setInterval(() => {
       refreshProcesses()
     }, 2000)
 
     return () => clearInterval(interval)
-  }, [refreshWfpStatus, refreshProcesses])
+  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids])
 
   const blockedCount = processes.filter((p) => p.status === "blocked").length
   const blockedApps = processes.filter((p) => p.status === "blocked")
@@ -117,6 +149,10 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         unblockApp,
         refreshProcesses,
         blockedCount,
+        suspendProcess,
+        resumeProcess,
+        killProcess,
+        suspendedPids,
       }}
     >
       {children}

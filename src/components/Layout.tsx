@@ -11,6 +11,7 @@ import {
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
+import { Toaster } from "@/components/ui/sonner"
 import { useShield } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
 
@@ -171,6 +172,9 @@ export function Layout() {
           </div>
         </main>
       </div>
+
+      {/* Toast notifications */}
+      <Toaster position="bottom-right" richColors closeButton />
     </div>
   )
 }
