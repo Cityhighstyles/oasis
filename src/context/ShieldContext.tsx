@@ -9,6 +9,7 @@ export type ProcessEntry = {
   exe: string
   status: ProcessStatus
   sessionData: number
+  speed: number
   connections: number
   lastSeen: string
 }

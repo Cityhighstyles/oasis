@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from "react"
+import { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react"
 import {
   Search,
   RefreshCw,
@@ -12,6 +12,8 @@ import {
   PlayCircle,
   Trash2,
   ShieldBan,
+  ArrowDownWideNarrow,
+  ArrowDownAZ,
 } from "lucide-react"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -134,6 +136,96 @@ function StatusBadge({ status, className }: StatusBadgeProps) {
   )
 }
 
+// ──────────────────── filter / system service helpers ────────────────
+
+type FilterPreset = "all" | "active" | "system" | "paused" | "blocked"
+
+function getExeName(path: string): string {
+  return path.split(/[/\\]/).pop()?.toLowerCase() ?? ""
+}
+
+/// Executable names of known background data-hogging system services.
+const SYSTEM_SERVICE_EXES = new Set([
+  "svchost.exe",
+  "wuauserv.exe",
+  "msmpeng.exe",
+  "onedrive.exe",
+  "backgroundtransferhost.exe",
+  "tiworker.exe",
+  "trustedinstaller.exe",
+  "sppsvc.exe",
+  "deliveryoptimization.exe",
+  "dosvc.exe",
+  "mohelper.exe",
+  "searchindexer.exe",
+  "wermgr.exe",
+  "dllhost.exe",
+  "taskhostw.exe",
+  "runtimebroker.exe",
+  "sihost.exe",
+  "startmenuexperiencehost.exe",
+])
+
+// ──────────────────────────── speed helpers ──────────────────────────
+
+type SpeedTrend = "stable" | "rising" | "spiking"
+
+function computeTrend(history: number[]): SpeedTrend {
+  if (history.length < 3) return "stable"
+  const latest = history[history.length - 1]
+  if (latest <= 0) return "stable"
+  const prevAvg = history.slice(0, -1).reduce((s, v) => s + v, 0) / (history.length - 1)
+  if (prevAvg <= 0) return latest > 0 ? "rising" : "stable"
+  const ratio = latest / prevAvg
+  if (ratio >= 3) return "spiking"
+  if (ratio >= 1.5) return "rising"
+  return "stable"
+}
+
+const TREND_TEXT: Record<SpeedTrend, string> = {
+  stable: "text-neon-emerald",
+  rising: "text-amber-400",
+  spiking: "text-destructive",
+}
+
+const TREND_BG: Record<SpeedTrend, string> = {
+  stable: "bg-neon-emerald/50",
+  rising: "bg-amber-400/50",
+  spiking: "bg-destructive/50",
+}
+
+function formatSpeed(bytesPerSecond: number): string {
+  if (bytesPerSecond >= 1024 * 1024) {
+    return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
+  } else if (bytesPerSecond >= 1024) {
+    return `${(bytesPerSecond / 1024).toFixed(0)} KB/s`
+  } else if (bytesPerSecond > 0) {
+    return `${bytesPerSecond.toFixed(0)} B/s`
+  }
+  return ""
+}
+
+function MicroSparkline({ samples, maxVal, trend = "stable" }: { samples: number[]; maxVal: number; trend?: SpeedTrend }) {
+  const barCount = 6
+  // Take the most recent samples, pad with 0s if fewer than barCount
+  const filled = [...Array(barCount - Math.min(barCount, samples.length)).fill(0), ...samples.slice(-barCount)]
+
+  return (
+    <div className="flex items-end gap-[2px] h-3">
+      {filled.map((val, i) => {
+        const pct = maxVal > 0 ? Math.min(100, (val / maxVal) * 100) : 0
+        return (
+          <div
+            key={i}
+            className={cn("w-[3px] rounded-[1px] transition-all duration-300", TREND_BG[trend])}
+            style={{ height: `${Math.max(pct > 0 ? 2 : 1, pct)}%`, minHeight: pct > 0 ? "2px" : "1px" }}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
 type ProcessRowProps = {
   proc: ProcessEntry
   isOperating: string | null
@@ -143,10 +235,12 @@ type ProcessRowProps = {
   onSuspend: (pid: number) => void
   onResume: (pid: number) => void
   onKill: (pid: number, name: string) => void
+  onDropdownOpenChange: (open: boolean) => void
+  speedTrend: SpeedTrend
   isLocked: boolean
 }
 
-function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended, onSuspend, onResume, onKill, isLocked }: ProcessRowProps) {
+function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended, onSuspend, onResume, onKill, onDropdownOpenChange, speedTrend, isLocked }: ProcessRowProps) {
   const s = STATUS_CONFIG[proc.status]
   const isBlocked = proc.status === "blocked"
   const isOperatingNow = isOperating === proc.exe
@@ -198,15 +292,22 @@ function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended
         )}
       </div>
 
-      {/* Session data usage */}
-      <span
-        className={cn(
-          "self-center tabular-nums font-medium text-[11px]",
-          proc.sessionData > 0 ? "text-foreground/70" : "text-muted-foreground/40"
+      {/* Session data usage + speed */}
+      <div className="self-center">
+        <span
+          className={cn(
+            "tabular-nums font-medium text-[11px]",
+            proc.sessionData > 0 ? "text-foreground/70" : "text-muted-foreground/40"
+          )}
+        >
+          {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
+        </span>
+        {proc.speed > 0 && (
+          <span className={cn("block text-[9px] tabular-nums font-medium leading-tight mt-0.5", TREND_TEXT[speedTrend])}>
+            ↑ {formatSpeed(proc.speed)}
+          </span>
         )}
-      >
-        {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
-      </span>
+      </div>
 
       {/* Last active */}
       <span
@@ -222,13 +323,13 @@ function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended
 
       {/* Action dropdown */}
       <div className="self-center flex justify-center">
-        <DropdownMenu>
+        <DropdownMenu onOpenChange={(open) => onDropdownOpenChange(open)}>
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
               size="sm"
               className="h-6 w-6 p-0 text-muted-foreground/50 hover:text-foreground hover:bg-accent/50"
-              disabled={isLocked || (!wfpAvailable && !isSuspended)}
+              disabled={isLocked || (!wfpAvailable && !isSuspended) || isOperatingNow}
             >
               {isLocked ? (
                 <RefreshCw className="size-3 animate-spin text-muted-foreground/50" />
@@ -298,9 +399,67 @@ export function LiveMonitor() {
   const [killConfirm, setKillConfirm] = useState<{ pid: number; name: string } | null>(null)
   const processingLock = useRef(false)
 
-  /// Wrap an async action with a global lock to prevent concurrent IPC calls.
+  // ─── Filter preset ───
+  const [filterPreset, setFilterPreset] = useState<FilterPreset>("all")
+
+  // ─── Sort freeze (prevent reordering while interacting) ───
+  const frozenGroupsRef = useRef<ProcessGroup[]>([])
+  const [isHovering, setIsHovering] = useState(false)
+  const [dropdownOpenCount, setDropdownOpenCount] = useState(0)
+  const isFrozen = isHovering || dropdownOpenCount > 0
+
+  const handleMouseEnter = useCallback(() => setIsHovering(true), [])
+  const handleMouseLeave = useCallback(() => setIsHovering(false), [])
+  const handleDropdownOpenChange = useCallback((open: boolean) => {
+    setDropdownOpenCount((prev) => Math.max(0, prev + (open ? 1 : -1)))
+  }, [])
+
+  // ─── Speed history for sparklines ───
+  const speedHistoryRef = useRef<Map<string, number[]>>(new Map())
+  const pidSpeedHistoryRef = useRef<Map<number, number[]>>(new Map())
+
+  // ─── FLIP animation for smooth reordering ───
+  const containerRef = useRef<HTMLDivElement>(null)
+  const prevPositionsRef = useRef<Map<string, DOMRect>>(new Map())
+
+  useLayoutEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    const children = Array.from(container.children) as HTMLElement[]
+    const newPositions = new Map<string, DOMRect>()
+
+    for (const child of children) {
+      const key = child.getAttribute("data-group-key")
+      if (!key) continue
+      const rect = child.getBoundingClientRect()
+      newPositions.set(key, { ...rect })
+
+      const prevRect = prevPositionsRef.current.get(key)
+      if (prevRect && !isFrozen) {
+        const dx = prevRect.left - rect.left
+        const dy = prevRect.top - rect.top
+        if (dx !== 0 || dy !== 0) {
+          child.animate(
+            [
+              { transform: `translate(${dx}px, ${dy}px)` },
+              { transform: "translate(0, 0)" },
+            ],
+            {
+              duration: 350,
+              easing: "cubic-bezier(0.4, 0, 0.2, 1)",
+              fill: "both",
+            }
+          )
+        }
+      }
+    }
+
+    prevPositionsRef.current = newPositions
+  })
+
   const withLock = useCallback(
-    <T>(fn: () => Promise<T>): Promise<T> | undefined => {
+    <T,>(fn: () => Promise<T>): Promise<T> | undefined => {
       if (processingLock.current) return undefined
       processingLock.current = true
       return fn().finally(() => {
@@ -347,16 +506,14 @@ export function LiveMonitor() {
         if (isBlocked) {
           await unblockApp(group.exe)
           toast.success("Network unblocked", {
-            description: `${group.name} (${group.pidCount} ${
-              group.pidCount === 1 ? "PID" : "PIDs"
-            }) can now access the network`,
+            description: `${group.name} (${group.pidCount} ${group.pidCount === 1 ? "PID" : "PIDs"
+              }) can now access the network`,
           })
         } else {
           await blockApp(group.exe)
           toast.success("Network blocked", {
-            description: `${group.name} (${group.pidCount} ${
-              group.pidCount === 1 ? "PID" : "PIDs"
-            }) has been blocked from the network`,
+            description: `${group.name} (${group.pidCount} ${group.pidCount === 1 ? "PID" : "PIDs"
+              }) has been blocked from the network`,
           })
         }
       } catch (err) {
@@ -430,22 +587,19 @@ export function LiveMonitor() {
   }, [resumeProcess, withLock])
 
   const handleKill = useCallback(async (pid: number, name: string) => {
+    // Clear modal instantly so UI doesn't visually hang open
+    setKillConfirm(null)
+
     const result = withLock(async () => {
       setActionInProgress(`kill:${pid}`)
       try {
         await killProcess(pid)
-        toast.success("Process terminated", {
-          description: `${name} (PID ${pid}) has been killed`,
-        })
+        toast.success("Process terminated", { description: `${name} (PID ${pid}) killed.` })
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        toast.error("Termination failed", {
-          description: msg,
-        })
+        toast.error("Termination failed", { description: String(err) })
       } finally {
         setActionInProgress(null)
       }
-      setKillConfirm(null)
     })
     if (result === undefined) {
       toast.info("Please wait", { description: "Another action is still in progress." })
@@ -523,13 +677,29 @@ export function LiveMonitor() {
 
   // Filter, group, and sort
   const { groups, blocked, active } = useMemo(() => {
+    let filtered = processes
+
+    // Apply filter preset
+    if (filterPreset === "active") {
+      filtered = filtered.filter((p) => p.status === "active")
+    } else if (filterPreset === "system") {
+      filtered = filtered.filter((p) => SYSTEM_SERVICE_EXES.has(getExeName(p.exe)))
+    } else if (filterPreset === "blocked") {
+      filtered = filtered.filter((p) => p.status === "blocked")
+    } else if (filterPreset === "paused") {
+      filtered = filtered.filter((p) => suspendedPids.has(p.pid))
+    }
+
+    // Apply search text
     const lowerSearch = search.toLowerCase()
-    const filtered = processes.filter((p) => {
-      return (
-        p.name.toLowerCase().includes(lowerSearch) ||
-        p.exe.toLowerCase().includes(lowerSearch)
-      )
-    })
+    if (lowerSearch) {
+      filtered = filtered.filter((p) => {
+        return (
+          p.name.toLowerCase().includes(lowerSearch) ||
+          p.exe.toLowerCase().includes(lowerSearch)
+        )
+      })
+    }
 
     const grouped = groupProcesses(filtered)
 
@@ -539,6 +709,9 @@ export function LiveMonitor() {
       else if (sortField === "status") cmp = a.status.localeCompare(b.status)
       else if (sortField === "sessionData") cmp = a.totalSessionData - b.totalSessionData
       else if (sortField === "connections") cmp = a.totalConnections - b.totalConnections
+      // Stable tiebreakers — prevent arbitrary reordering when primary values match
+      if (cmp === 0) cmp = a.name.localeCompare(b.name)
+      if (cmp === 0) cmp = a.key.localeCompare(b.key)
       return sortOrder === "asc" ? cmp : -cmp
     })
 
@@ -547,15 +720,36 @@ export function LiveMonitor() {
       group.processes.sort((a, b) => a.pid - b.pid)
     }
 
+    // Update frozen snapshot when not interacting
+    if (!isFrozen) {
+      frozenGroupsRef.current = grouped
+    }
+
     const blockedCount = processes.filter((p) => p.status === "blocked").length
     const activeCount = processes.filter((p) => p.status === "active").length
 
     return {
-      groups: grouped,
+      groups: isFrozen ? frozenGroupsRef.current : grouped,
       blocked: blockedCount,
       active: activeCount,
     }
-  }, [processes, search, sortField, sortOrder])
+  }, [processes, search, sortField, sortOrder, filterPreset, suspendedPids, isFrozen])
+
+  // Track speed history for sparklines (group + per-PID)
+  useEffect(() => {
+    const sh = speedHistoryRef.current
+    const ph = pidSpeedHistoryRef.current
+    for (const group of groups) {
+      const totalSpeed = group.processes.reduce((s, p) => s + p.speed, 0)
+      const prev = sh.get(group.key) ?? []
+      sh.set(group.key, [...prev.slice(-11), totalSpeed])
+
+      for (const proc of group.processes) {
+        const pidPrev = ph.get(proc.pid) ?? []
+        ph.set(proc.pid, [...pidPrev.slice(-11), proc.speed])
+      }
+    }
+  }, [groups])
 
   function SortIcon({ k }: { k: SortKey }) {
     if (sortField !== k)
@@ -618,6 +812,43 @@ export function LiveMonitor() {
                 className="h-8 pl-8 bg-background/50 text-xs border-border focus-visible:ring-ring/50"
               />
             </div>
+
+            {/* Sort mode toggle */}
+            <div className="flex items-center gap-0.5 bg-muted/60 rounded-md p-0.5 border border-border/50">
+              <button
+                onClick={() => {
+                  setSortField("sessionData")
+                  setSortOrder("desc")
+                }}
+                className={cn(
+                  "flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-all duration-150",
+                  sortField === "sessionData" && sortOrder === "desc"
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground/60 hover:text-foreground"
+                )}
+                title="Sort by data usage (highest first)"
+              >
+                <ArrowDownWideNarrow className="size-3" />
+                Data
+              </button>
+              <button
+                onClick={() => {
+                  setSortField("name")
+                  setSortOrder("asc")
+                }}
+                className={cn(
+                  "flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-all duration-150",
+                  sortField === "name" && sortOrder === "asc"
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground/60 hover:text-foreground"
+                )}
+                title="Sort alphabetically by name"
+              >
+                <ArrowDownAZ className="size-3" />
+                Name
+              </button>
+            </div>
+
             <Button
               variant="outline"
               size="sm"
@@ -645,6 +876,30 @@ export function LiveMonitor() {
               />
               {isShieldActive ? "Shield Active" : "Shield Off"}
             </Badge>
+          </div>
+
+          {/* Filter preset tabs */}
+          <div className="flex items-center gap-1 mt-2 pt-2 border-t border-border/40">
+            {([
+              { key: "all" as FilterPreset, label: "All Processes" },
+              { key: "active" as FilterPreset, label: "Active" },
+              { key: "system" as FilterPreset, label: "System" },
+              { key: "paused" as FilterPreset, label: "Paused" },
+              { key: "blocked" as FilterPreset, label: "Blocked" },
+            ]).map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => setFilterPreset(key)}
+                className={cn(
+                  "px-2.5 py-1 rounded-md text-[11px] font-medium transition-all duration-150",
+                  filterPreset === key
+                    ? "bg-accent text-foreground shadow-sm"
+                    : "text-muted-foreground/60 hover:text-foreground hover:bg-accent/40"
+                )}
+              >
+                {label}
+              </button>
+            ))}
           </div>
         </CardHeader>
 
@@ -677,7 +932,13 @@ export function LiveMonitor() {
           </div>
 
           {/* Grouped rows */}
-          <div className="divide-y divide-border font-mono text-xs">
+          <div
+            ref={containerRef}
+            className="divide-y divide-border font-mono text-xs"
+            style={{ overflowAnchor: "auto" }}
+            onMouseEnter={handleMouseEnter}
+            onMouseLeave={handleMouseLeave}
+          >
             {groups.map((group) => {
               const s = STATUS_CONFIG[group.status]
               const isBlocked = group.status === "blocked"
@@ -690,9 +951,15 @@ export function LiveMonitor() {
                 actionInProgress === `suspend-group:${group.key}` ||
                 actionInProgress === `resume-group:${group.key}`
 
+              const totalSpeed = group.processes.reduce((s, p) => s + p.speed, 0)
+              const history = speedHistoryRef.current.get(group.key) ?? []
+              const maxSpeed = Math.max(1, ...history)
+              const trend = computeTrend(history)
+
               return (
                 <Collapsible
                   key={group.key}
+                  data-group-key={group.key}
                   open={isExpanded}
                   onOpenChange={() => toggleGroup(group.key)}
                 >
@@ -739,19 +1006,29 @@ export function LiveMonitor() {
                         <StatusBadge status={group.status} />
                       </div>
 
-                      {/* Session data usage (aggregate) */}
-                      <span
-                        className={cn(
-                          "self-center tabular-nums font-medium",
-                          group.totalSessionData > 0
-                            ? "text-foreground"
-                            : "text-muted-foreground/40"
+                      {/* Session data usage (aggregate) + speed */}
+                      <div className="self-center">
+                        <span
+                          className={cn(
+                            "tabular-nums font-medium",
+                            group.totalSessionData > 0
+                              ? "text-foreground"
+                              : "text-muted-foreground/40"
+                          )}
+                        >
+                          {group.totalSessionData > 0
+                            ? `${group.totalSessionData} MB`
+                            : "—"}
+                        </span>
+                        {totalSpeed > 0 && (
+                          <div className="flex items-center gap-1 mt-0.5">
+                            <span className={cn("text-[9px] tabular-nums font-medium", TREND_TEXT[trend])}>
+                              ↑ {formatSpeed(totalSpeed)}
+                            </span>
+                            <MicroSparkline samples={history} maxVal={maxSpeed} trend={trend} />
+                          </div>
                         )}
-                      >
-                        {group.totalSessionData > 0
-                          ? `${group.totalSessionData} MB`
-                          : "—"}
-                      </span>
+                      </div>
 
                       {/* Last active */}
                       <span
@@ -839,19 +1116,26 @@ export function LiveMonitor() {
                   {/* Expanded PID sub-rows */}
                   <CollapsibleContent>
                     <div className="divide-y divide-border/50">
-                      {group.processes.map((proc) => (
-                        <PidSubRow
-                          key={proc.pid}
-                          proc={proc}
-                          isOperating={actionInProgress}
-                          onToggleBlock={handleToggleBlock}
-                          wfpAvailable={wfpAvailable}
-                          isSuspended={suspendedPids.has(proc.pid)}
-                          onSuspend={handleSuspend}
-                          onResume={handleResume}
-                          onKill={(pid, name) => setKillConfirm({ pid, name })}
-                        />
-                      ))}
+                      {group.processes.map((proc) => {
+                        const pidHistory = pidSpeedHistoryRef.current.get(proc.pid) ?? []
+                        const pidTrend = computeTrend(pidHistory)
+                        return (
+                          <PidSubRow
+                            key={proc.pid}
+                            proc={proc}
+                            isOperating={actionInProgress}
+                            onToggleBlock={handleToggleBlock}
+                            wfpAvailable={wfpAvailable}
+                            isSuspended={suspendedPids.has(proc.pid)}
+                            onSuspend={handleSuspend}
+                            onResume={handleResume}
+                            onKill={(pid, name) => setKillConfirm({ pid, name })}
+                            onDropdownOpenChange={handleDropdownOpenChange}
+                            speedTrend={pidTrend}
+                            isLocked={processingLock.current}
+                          />
+                        )
+                      })}
                     </div>
                   </CollapsibleContent>
                 </Collapsible>

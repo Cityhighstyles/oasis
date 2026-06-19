@@ -83,6 +83,9 @@ pub struct ProcessEntry {
     pub status: String,
     /// MB transferred during this app session (cumulative, all protocols via IO counters).
     pub session_data: f64,
+    /// Real-time speed in bytes/sec (delta since last 2-second poll tick).
+    /// 0 for dormant/monitoring processes.
+    pub speed: f64,
     /// TCP + UDP socket count from the current snapshot.
     pub connections: usize,
     /// "now" while active, or last HH:MM:SS timestamp when dormant.
@@ -242,6 +245,9 @@ impl NetworkEngine {
             let pid_cumulative = self.per_pid_cumulative.get(pid).copied().unwrap_or(0);
             let session_mb = round2(bytes_to_mb(pid_cumulative));
 
+            // Speed in bytes/sec from the delta (poll interval is 2 seconds)
+            let speed = net_stats.bytes_in as f64 / 2.0;
+
             let status = if is_blocked {
                 "blocked"
             } else if connections > 0 {
@@ -256,6 +262,7 @@ impl NetworkEngine {
                 exe: net_stats.exe_path.clone(),
                 status: status.to_string(),
                 session_data: session_mb,
+                speed,
                 connections,
                 last_seen: if status == "active" {
                     "now".to_string()
@@ -303,6 +310,7 @@ impl NetworkEngine {
                         exe: exe_display,
                         status: "monitoring".to_string(),
                         session_data: session_mb,
+                        speed: 0.0,
                         connections: 0,
                         last_seen: prev_last_seen,
                     });
