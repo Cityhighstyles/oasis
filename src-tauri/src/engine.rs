@@ -22,7 +22,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "windows")]
-use crate::iphelper;
+use crate::iphelper::{self, ProcessNetStats};
 
 #[cfg(target_os = "windows")]
 use crate::wfp::WfpEngine;
@@ -31,18 +31,6 @@ use crate::wfp::WfpEngine;
 #[cfg(not(target_os = "windows"))]
 mod stub {
     use std::collections::HashMap;
-
-    // Minimal ProcessNetStats duplicate so the stub iphelper can compile
-    // without a circular dependency on engine::ProcessNetStats.
-    #[derive(Clone, Debug, Default)]
-    pub struct ProcessNetStats {
-        pub pid: u32,
-        pub exe_path: String,
-        pub bytes_in: u64,
-        pub bytes_out: u64,
-        pub tcp_connections: usize,
-        pub udp_connections: usize,
-    }
 
     pub struct WfpEngine;
     impl WfpEngine {
@@ -59,22 +47,26 @@ mod stub {
         pub fn blocked_paths(&self) -> Vec<String> { vec![] }
     }
 
+    // Stub fallback version for non-Windows architectures
+    #[derive(Clone, Debug, Default)]
+    pub struct ProcessNetStats {
+        pub pid: u32,
+        pub exe_path: String,
+        pub bytes_in: u64,
+        pub bytes_out: u64,
+        pub tcp_connections: usize,
+        pub udp_connections: usize,
+    }
+
     pub mod iphelper {
         use std::collections::HashMap;
         use super::ProcessNetStats;
         pub fn collect_udp_counts(_: &mut HashMap<u32, ProcessNetStats>) {}
     }
-
-    // collect_tcp_connection_stats() intentionally omitted — the entire
-    // TCP delta block in poll() is #[cfg(windows)], so this module only
-    // needs the UDP stub for the shared code path.
 }
 
 #[cfg(not(target_os = "windows"))]
-use stub::WfpEngine;
-
-#[cfg(not(target_os = "windows"))]
-use stub::iphelper;
+use stub::{WfpEngine, iphelper, ProcessNetStats};
 
 // ──────────────────────────── data contract ──────────────────────────────────
 
@@ -96,7 +88,6 @@ pub struct ProcessEntry {
     /// "now" while active, or last HH:MM:SS timestamp when dormant.
     pub last_seen: String,
 }
-
 // ────────────────────────────── engine state ─────────────────────────────────
 
 /// Persisted per-process accounting that survives across polling ticks.
