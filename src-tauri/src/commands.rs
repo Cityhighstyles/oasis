@@ -291,13 +291,13 @@ pub fn estimate_command_size(
     command_type: String,
     state: State<'_, SandboxState>,
 ) -> Result<serde_json::Value, String> {
-    let engine = state
+    let _engine = state
         .0
         .lock()
         .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
     // Parse command type string back to enum
-    let cmd_type = parse_command_type(&command_type);
-    let (est, rmin, rmax, conf, reasoning) = engine.local_estimate(&cmd_type);
+    let cmd_type = CommandType::from_label(&command_type);
+    let (est, rmin, rmax, conf, reasoning) = SandboxEngine::local_estimate(&cmd_type);
     Ok(serde_json::json!({
         "estimatedMb": est,
         "rangeMinMb": rmin,
@@ -357,6 +357,46 @@ pub fn close_sandbox_overlay(
     Ok(())
 }
 
+/// Start the sandbox process scanner. If already running, this is a no-op.
+#[tauri::command]
+pub fn start_sandbox_scanner(
+    app: tauri::AppHandle,
+    state: State<'_, SandboxState>,
+) -> Result<(), String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+
+    if engine.is_running {
+        log::info!("start_sandbox_scanner: scanner already running, ignoring");
+        return Ok(());
+    }
+    drop(engine); // release lock before spawning
+
+    let engine_clone = Arc::clone(&state.0);
+    crate::sandbox::start_scanner(engine_clone, Some(app));
+    Ok(())
+}
+
+/// Stop the sandbox process scanner. If not running, this is a no-op.
+#[tauri::command]
+pub fn stop_sandbox_scanner(
+    state: State<'_, SandboxState>,
+) -> Result<(), String> {
+    let engine = state.0.lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+
+    if !engine.is_running {
+        log::info!("stop_sandbox_scanner: scanner not running, ignoring");
+        return Ok(());
+    }
+    drop(engine);
+
+    crate::sandbox::stop_scanner(&state.0);
+    Ok(())
+}
+
 /// Get the sandbox scanner status.
 #[tauri::command]
 pub fn get_sandbox_status(
@@ -374,41 +414,5 @@ pub fn get_sandbox_status(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
-
-fn parse_command_type(s: &str) -> CommandType {
-    match s.to_lowercase().as_str() {
-        "npminstall" | "npm install" => CommandType::NpmInstall,
-        "pnpminstall" | "pnpm install" => CommandType::PnpmInstall,
-        "yarninstall" | "yarn install" => CommandType::YarnInstall,
-        "npxrun" | "npx run" => CommandType::NpxRun,
-        "dockerpull" | "docker pull" => CommandType::DockerPull,
-        "dockerbuild" | "docker build" => CommandType::DockerBuild,
-        "dockercompose" | "docker compose" => CommandType::DockerCompose,
-        "gitclone" | "git clone" => CommandType::GitClone,
-        "gitpull" | "git pull" => CommandType::GitPull,
-        "gitfetch" | "git fetch" => CommandType::GitFetch,
-        "vscodeextinstall" | "vscode extension install" => CommandType::VscodeExtInstall,
-        "vscodeextupdate" | "vscode extension update" => CommandType::VscodeExtUpdate,
-        "pipinstall" | "pip install" => CommandType::PipInstall,
-        "pipenvinstall" | "pipenv install" => CommandType::PipenvInstall,
-        "poetryinstall" | "poetry install" => CommandType::PoetryInstall,
-        "cargoinstall" | "cargo install" => CommandType::CargoInstall,
-        "cargobuild" | "cargo build" => CommandType::CargoBuild,
-        "cargotest" | "cargo test" => CommandType::CargoTest,
-        "wingetinstall" | "winget install" => CommandType::WingetInstall,
-        "chocoinstall" | "choco install" | "chocolateyinstall" => CommandType::ChocoInstall,
-        "scoopinstall" | "scoop install" => CommandType::ScoopInstall,
-        "brewinstall" | "brew install" => CommandType::BrewInstall,
-        "aptgetinstall" | "apt-get install" => CommandType::AptGetInstall,
-        "nugetinstall" | "nuget install" => CommandType::NugetInstall,
-        "dotnetrestore" | "dotnet restore" => CommandType::DotnetRestore,
-        "dotnetbuild" | "dotnet build" => CommandType::DotnetBuild,
-        "gomoddownload" | "go mod download" => CommandType::GoModDownload,
-        "goinstall" | "go install" => CommandType::GoInstall,
-        "gobuild" | "go build" => CommandType::GoBuild,
-        "mavenbuild" | "mvn build" => CommandType::MavenBuild,
-        "gradlebuild" | "gradle build" => CommandType::GradleBuild,
-        "androidstudiodownload" | "android studio download" => CommandType::AndroidStudioDownload,
-        _ => CommandType::Other(s.to_string()),
-    }
-}
+// Note: parse_command_type was removed — CommandType::from_label() on the enum
+// provides the equivalent functionality with less duplication.

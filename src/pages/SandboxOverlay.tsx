@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react"
-import { useParams, useNavigate } from "react-router-dom"
-import { X, ExternalLink, Terminal, Package, Container, GitBranch, Puzzle, Snake, Crab, Download, Bot, HardHat } from "lucide-react"
+import { useState, useEffect, useRef } from "react"
+import { useParams } from "react-router-dom"
+import { invoke } from "@tauri-apps/api/core"
+import { X, Terminal, Package, Container, GitBranch, Puzzle, FileCode, Cog, Download, Bot, HardHat } from "lucide-react"
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow"
 import type { DetectedOperation } from "./DevSandbox"
 import { Button } from "@/components/ui/button"
@@ -12,27 +13,29 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   container: Container,
   "git-branch": GitBranch,
   puzzle: Puzzle,
-  snake: Snake,
-  crab: Crab,
+  snake: FileCode,
+  crab: Cog,
   download: Download,
   bot: Bot,
   "hard-hat": HardHat,
+  beer: Package,
+  linux: Terminal,
+  dotnet: Terminal,
+  globe: Package,
   terminal: Terminal,
 }
 
 export function SandboxOverlay() {
   const { operationId: paramId } = useParams()
-  const navigate = useNavigate()
   const [operationId, setOperationId] = useState<string | null>(paramId || null)
   const [operation, setOperation] = useState<DetectedOperation | null>(null)
-  const [isDragging, setIsDragging] = useState(false)
+  const hasReceivedEvent = useRef(false)
 
   // Resolve operationId from params or window data
   useEffect(() => {
     if (paramId) {
       setOperationId(paramId)
     } else {
-      // Fallback: read from a global set by the Rust backend
       const win = window as any
       if (win.__SANDBOX_OP_ID__) {
         setOperationId(win.__SANDBOX_OP_ID__)
@@ -40,11 +43,13 @@ export function SandboxOverlay() {
     }
   }, [paramId])
 
+  // Primary: listen for live updates via events
   useEffect(() => {
     if (!operationId) return
     const unlisten = appWindow?.listen<DetectedOperation>("sandbox-operation-updated", (event) => {
       if (event.payload.id === operationId) {
         setOperation(event.payload)
+        hasReceivedEvent.current = true
       }
     })
 
@@ -53,14 +58,44 @@ export function SandboxOverlay() {
     }
   }, [operationId])
 
-  const close = () => {
-    navigate("/")
-    window.close()
+  // Fallback: poll backend every 5s if no event has been received yet
+  useEffect(() => {
+    if (!operationId) return
+
+    const interval = setInterval(async () => {
+      if (hasReceivedEvent.current) {
+        clearInterval(interval)
+        return
+      }
+
+      try {
+        const operations: DetectedOperation[] = await invoke("get_sandbox_operations")
+        const match = operations.find((op) => op.id === operationId)
+        if (match) {
+          setOperation(match)
+        }
+      } catch {
+        // Silently retry on next tick
+      }
+    }, 5000)
+
+    return () => clearInterval(interval)
+  }, [operationId])
+
+  const close = async () => {
+    if (operationId) {
+      try {
+        await invoke("close_sandbox_overlay", { operationId })
+      } catch {
+        // Fallback: close window directly if backend command fails
+        appWindow?.close()
+      }
+    } else {
+      appWindow?.close()
+    }
   }
 
-  const startDrag = (e: React.MouseEvent) => {
-    setIsDragging(true)
-    setDragStart({ x: e.clientX, y: e.clientY })
+  const startDrag = () => {
     appWindow?.startDragging()
   }
 
@@ -72,7 +107,7 @@ export function SandboxOverlay() {
     <div className="h-screen w-screen flex flex-col bg-background/80 backdrop-blur-xl border border-neon-emerald/20 rounded-xl overflow-hidden">
       {/* Drag handle */}
       <div
-        className="flex items-center justify-between px-4 py-2 bg-card/50 cursor-grab active:cursor-grabbing select-none"
+        className="flex items-center justify-between px-4 py-2 bg-card/50"
         onMouseDown={startDrag}
       >
         <div className="flex items-center gap-2">

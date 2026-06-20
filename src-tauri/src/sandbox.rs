@@ -9,14 +9,14 @@
 //!  - The Groq API client predicts download sizes based on the command and
 //!    any available metadata (e.g. package.json contents).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use log;
-use std::process::Command as StdCommand;
 
 // ── Supported command types ─────────────────────────────────────────────────
 
@@ -137,6 +137,45 @@ impl CommandType {
             CommandType::Other(_) => "terminal",
         }
     }
+
+    /// Parse a command type from its lowercase string label.
+    pub fn from_label(label: &str) -> Self {
+        match label.to_lowercase().as_str() {
+            "npm install" => CommandType::NpmInstall,
+            "pnpm install" => CommandType::PnpmInstall,
+            "yarn install" => CommandType::YarnInstall,
+            "npx run" => CommandType::NpxRun,
+            "docker pull" => CommandType::DockerPull,
+            "docker build" => CommandType::DockerBuild,
+            "docker compose" => CommandType::DockerCompose,
+            "git clone" => CommandType::GitClone,
+            "git pull" => CommandType::GitPull,
+            "git fetch" => CommandType::GitFetch,
+            "vscode extension install" => CommandType::VscodeExtInstall,
+            "vscode extension update" => CommandType::VscodeExtUpdate,
+            "pip install" => CommandType::PipInstall,
+            "pipenv install" => CommandType::PipenvInstall,
+            "poetry install" => CommandType::PoetryInstall,
+            "cargo install" => CommandType::CargoInstall,
+            "cargo build" => CommandType::CargoBuild,
+            "cargo test" => CommandType::CargoTest,
+            "winget install" => CommandType::WingetInstall,
+            "choco install" | "chocolatey install" => CommandType::ChocoInstall,
+            "scoop install" => CommandType::ScoopInstall,
+            "brew install" => CommandType::BrewInstall,
+            "apt-get install" => CommandType::AptGetInstall,
+            "nuget install" => CommandType::NugetInstall,
+            "dotnet restore" => CommandType::DotnetRestore,
+            "dotnet build" => CommandType::DotnetBuild,
+            "go mod download" => CommandType::GoModDownload,
+            "go install" => CommandType::GoInstall,
+            "go build" => CommandType::GoBuild,
+            "maven build" | "mvn build" => CommandType::MavenBuild,
+            "gradle build" => CommandType::GradleBuild,
+            "android studio download" => CommandType::AndroidStudioDownload,
+            other => CommandType::Other(other.to_string()),
+        }
+    }
 }
 
 // ── Detected operation ────────────────────────────────────────────────────
@@ -220,6 +259,10 @@ pub struct SandboxEngine {
     pub is_running: bool,
     /// Counter for generating IDs.
     id_counter: u64,
+    /// Stop signal for the background scanner thread.
+    scanner_stop_signal: Option<Arc<AtomicBool>>,
+    /// Set of (pid, cmdline_hash) for operations already detected (dedup).
+    seen_operations: HashSet<(u32, u64)>,
 }
 
 impl SandboxEngine {
@@ -231,6 +274,8 @@ impl SandboxEngine {
             groq_api_key: std::env::var("GROQ_API_KEY").ok(),
             is_running: false,
             id_counter: 0,
+            scanner_stop_signal: None,
+            seen_operations: HashSet::new(),
         }
     }
 
@@ -249,6 +294,16 @@ impl SandboxEngine {
         self.groq_api_key.as_deref()
     }
 
+    /// Set the stop signal for the background scanner thread.
+    pub fn set_stop_signal(&mut self, signal: Arc<AtomicBool>) {
+        self.scanner_stop_signal = Some(signal);
+    }
+
+    /// Take the stop signal (moves it out), used when stopping the scanner.
+    pub fn take_stop_signal(&mut self) -> Option<Arc<AtomicBool>> {
+        self.scanner_stop_signal.take()
+    }
+
     /// Return cloned list of detected operations (newest first).
     pub fn get_operations(&self) -> Vec<DetectedOperation> {
         let mut ops = self.detected_operations.clone();
@@ -260,6 +315,7 @@ impl SandboxEngine {
     pub fn clear_operations(&mut self) {
         self.detected_operations.clear();
         self.known_pids.clear();
+        self.seen_operations.clear();
     }
 
     /// Run one scan of the process table. Returns any newly detected operations.
@@ -282,13 +338,12 @@ impl SandboxEngine {
             }
             // Always update known PIDs
             self.known_pids.insert(*pid, exe_name.clone());
-        }
-
-        // Fetch command lines for new supported processes (batch via PowerShell)
-        let cmdlines = if !pids_needing_cmdline.is_empty() {
-            Self::fetch_command_lines(&pids_needing_cmdline)
+        }            // Fetch command lines + working dirs for new supported processes
+            // Uses native Win32 when possible, falls back gracefully.
+        let (cmdlines, workdirs) = if !pids_needing_cmdline.is_empty() {
+            Self::fetch_process_details(&pids_needing_cmdline)
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         };
 
         // Now classify each new process with its command line
@@ -300,8 +355,17 @@ impl SandboxEngine {
 
             let cmdline = cmdlines.get(pid).cloned().unwrap_or_default();
             if let Some(cmd_type) = classify_process_cmdline(exe_name, &cmdline) {
-                // Extract package name from command line if possible
+                // Build a dedup key: (pid, hash of cmdline)
+                let cmd_hash = fxhash(&cmdline);
+                let dedup_key = (*pid, cmd_hash);
+                if self.seen_operations.contains(&dedup_key) {
+                    continue; // Skip duplicate operation
+                }
+                self.seen_operations.insert(dedup_key);
+
+                // Extract package name and working directory
                 let package_name = extract_package_name(&cmd_type, &cmdline);
+                let working_dir = workdirs.get(pid).cloned().unwrap_or_default();
 
                 self.id_counter += 1;
                 let now = Local::now().format("%H:%M:%S%.3f").to_string();
@@ -318,7 +382,7 @@ impl SandboxEngine {
                     confidence: 0.0,
                     status: "detected".to_string(),
                     package_name,
-                    working_dir: String::new(),
+                    working_dir,
                     ai_reasoning: String::new(),
                 };
                 self.detected_operations.push(op.clone());
@@ -326,10 +390,11 @@ impl SandboxEngine {
             }
         }
 
-        // Clean up stale PIDs
-        let current_pids: std::collections::HashSet<u32> =
+        // Clean up stale PIDs from seen set
+        let current_pids: HashSet<u32> =
             current_processes.iter().map(|(pid, _, _)| *pid).collect();
         self.known_pids.retain(|pid, _| current_pids.contains(pid));
+        self.seen_operations.retain(|(pid, _)| current_pids.contains(pid));
 
         new_ops
     }
@@ -385,23 +450,41 @@ impl SandboxEngine {
         vec![]
     }
 
+    /// Get process path via native kernel32 QueryFullProcessImageNameW.
+    /// Stub retained for enumerate_processes compatibility.
     #[cfg(target_os = "windows")]
     fn get_process_path(pid: u32) -> String {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn QueryFullProcessImageNameW(
+                h_process: HANDLE,
+                dw_flags: u32,
+                lp_exe_name: *mut u16,
+                lpdw_size: *mut u32,
+            ) -> i32;
+        }
 
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
                 return String::new();
             }
-            // Full path via QueryFullProcessImageNameW isn't available in
-            // windows-sys 0.61 — the exe name from the snapshot is sufficient.
+            let mut buf = [0u16; 260];
+            let mut size = buf.len() as u32;
+            let path = if QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) != 0 {
+                let slice = std::slice::from_raw_parts(buf.as_ptr(), size as usize);
+                String::from_utf16_lossy(slice)
+            } else {
+                String::new()
+            };
             CloseHandle(handle);
+            path
         }
-        String::new()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -409,159 +492,83 @@ impl SandboxEngine {
         String::new()
     }
 
-    // ── Command-line fetching via PowerShell (Windows) ───────────────────
+    // ── Native Win32 process detail fetching ────────────────────────────
+    //
+    // Replaces the old PowerShell-based approach with direct Win32 API calls
+    // via OpenProcess + QueryFullProcessImageNameW for the exe path (and
+    // working directory) and NtQueryInformationProcess for the command line.
 
-    /// Batch-fetch command lines for a set of PIDs using PowerShell / WMI.
-    /// Returns a map of PID → command_line string.
+    /// Batch-fetch command lines AND working directories for a set of PIDs
+    /// using native Win32 APIs. Returns (cmdlines, workdirs) maps.
     #[cfg(target_os = "windows")]
-    fn fetch_command_lines(pids: &[u32]) -> HashMap<u32, String> {
-        if pids.is_empty() {
-            return HashMap::new();
+    fn fetch_process_details(pids: &[u32]) -> (HashMap<u32, String>, HashMap<u32, String>) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        };
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn QueryFullProcessImageNameW(
+                h_process: HANDLE,
+                dw_flags: u32,
+                lp_exe_name: *mut u16,
+                lpdw_size: *mut u32,
+            ) -> i32;
         }
 
-        // Build a comma-separated PID list for PowerShell
-        let pid_list: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-        let pid_filter = pid_list.join(",");
+        let mut cmdlines = HashMap::new();
+        let mut workdirs = HashMap::new();
 
-        let script = format!(
-            r#"Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -in ({0}) }} | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"#,
-            pid_filter
-        );
-
-        let output = StdCommand::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output();
-
-        let mut result = HashMap::new();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let trimmed = stdout.trim();
-                if trimmed.is_empty() || trimmed == "null" {
-                    return result;
+        for &pid in pids {
+            unsafe {
+                let handle = OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                    0,
+                    pid,
+                );
+                if handle.is_null() {
+                    continue;
                 }
 
-                // PowerShell returns either a single object or an array
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let entries = match &parsed {
-                        serde_json::Value::Array(arr) => arr.clone(),
-                        serde_json::Value::Object(_) => vec![parsed.clone()],
-                        _ => return result,
-                    };
+                // Get the executable path via native API
+                let mut buf = [0u16; 260];
+                let mut size = buf.len() as u32;
+                let path = if QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) != 0 {
+                    let slice = std::slice::from_raw_parts(buf.as_ptr(), size as usize);
+                    String::from_utf16_lossy(slice)
+                } else {
+                    CloseHandle(handle);
+                    continue;
+                };
 
-                    for entry in entries {
-                        if let Some(obj) = entry.as_object() {
-                            let pid = obj.get("ProcessId")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                            let cmdline = obj.get("CommandLine")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if pid > 0 {
-                                result.insert(pid, cmdline);
-                            }
-                        }
+                // Derive working directory as the parent of the exe path
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    workdirs.insert(pid, parent.to_string_lossy().to_string());
+                }
+
+                // Fetch command line + actual working directory via PEB reading
+                if let Some((cmdline, cwd)) = read_process_cmdline_and_cwd(handle) {
+                    cmdlines.insert(pid, cmdline);
+                    if !cwd.is_empty() {
+                        workdirs.insert(pid, cwd);
                     }
                 }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                log::warn!("PowerShell command failed (exit {}): {}", out.status.code().unwrap_or(-1), stderr);
-            }
-            Err(e) => {
-                log::warn!("Failed to run PowerShell: {e}");
+
+                CloseHandle(handle);
             }
         }
 
-        result
+        (cmdlines, workdirs)
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn fetch_command_lines(_pids: &[u32]) -> HashMap<u32, String> {
-        HashMap::new()
-    }
-
-    /// Call Groq AI to predict download size for a detected operation.
-    /// Returns (estimated_mb, range_min_mb, range_max_mb, confidence, reasoning)
-    pub async fn predict_download_size(&self, op: &DetectedOperation) -> Option<(f64, f64, f64, f64, String)> {
-        let api_key = self.groq_api_key_ref()?.to_string();
-
-        let prompt = format!(
-            r#"You are a download size estimator for developer tools.
-Given this command type and executable name, predict the total download size in megabytes (MB).
-
-Command type: {command_type}
-Executable: {executable}
-
-Respond with a JSON object containing:
-- estimated_mb: best estimate in MB
-- range_min_mb: minimum likely download in MB  
-- range_max_mb: maximum likely download in MB
-- confidence: 0.0 to 1.0 confidence score
-- reasoning: short explanation for the estimate"#,
-            command_type = op.command_type.label(),
-            executable = op.executable,
-        );
-
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "estimated_mb": { "type": "number" },
-                "range_min_mb": { "type": "number" },
-                "range_max_mb": { "type": "number" },
-                "confidence": { "type": "number" },
-                "reasoning": { "type": "string" }
-            },
-            "required": ["estimated_mb", "range_min_mb", "range_max_mb", "confidence", "reasoning"],
-            "additionalProperties": false
-        });
-
-        let request = GroqRequest {
-            model: "llama-3.3-70b-versatile".to_string(),
-            messages: vec![GroqChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-            }],
-            response_format: GroqResponseFormat {
-                format_type: "json_schema".to_string(),
-                json_schema: GroqJsonSchema {
-                    name: "download_estimate".to_string(),
-                    strict: true,
-                    schema,
-                },
-            },
-        };
-
-        let client = reqwest::Client::new();
-        let response = client
-            .post("https://api.groq.com/openai/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .ok()?;
-
-        let groq_resp: GroqResponse = response.json().await.ok()?;
-        let content = groq_resp.choices.first()?.message.content.clone();
-
-        // Parse the JSON response
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-            let estimated = parsed.get("estimated_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let range_min = parsed.get("range_min_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let range_max = parsed.get("range_max_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let conf = parsed.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let reasoning = parsed.get("reasoning").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
-            Some((estimated, range_min, range_max, conf, reasoning))
-        } else {
-            None
-        }
+    fn fetch_process_details(_pids: &[u32]) -> (HashMap<u32, String>, HashMap<u32, String>) {
+        (HashMap::new(), HashMap::new())
     }
 
     /// Estimate download size locally (fallback when no Groq API key).
-    pub fn local_estimate(&self, cmd_type: &CommandType) -> (f64, f64, f64, f64, String) {
+    pub fn local_estimate(cmd_type: &CommandType) -> (f64, f64, f64, f64, String) {
         match cmd_type {
             // ── JS / Node ──────────────────────────────────────────────────
             CommandType::NpmInstall => (15.0, 1.0, 200.0, 0.5,
@@ -643,6 +650,255 @@ Respond with a JSON object containing:
                 "Unknown operation — generic estimate".into()),
         }
     }
+
+}
+
+// ── Standalone Groq API helper ───────────────────────────────────────────
+
+/// Call the Groq API to predict download size for a detected operation.
+/// Standalone free function so it can be called from the sync scanner thread
+/// via `tokio::runtime::Runtime::block_on` without holding the engine mutex.
+async fn groq_predict(api_key: &str, op: &DetectedOperation) -> Option<(f64, f64, f64, f64, String)> {
+    let prompt = format!(
+        r#"You are a download size estimator for developer tools.
+Given this command type and executable name, predict the total download size in megabytes (MB).
+
+Command type: {command_type}
+Executable: {executable}
+
+Respond with a JSON object containing:
+- estimated_mb: best estimate in MB
+- range_min_mb: minimum likely download in MB  
+- range_max_mb: maximum likely download in MB
+- confidence: 0.0 to 1.0 confidence score
+- reasoning: short explanation for the estimate"#,
+        command_type = op.command_type.label(),
+        executable = op.executable,
+    );
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "estimated_mb": { "type": "number" },
+            "range_min_mb": { "type": "number" },
+            "range_max_mb": { "type": "number" },
+            "confidence": { "type": "number" },
+            "reasoning": { "type": "string" }
+        },
+        "required": ["estimated_mb", "range_min_mb", "range_max_mb", "confidence", "reasoning"],
+        "additionalProperties": false
+    });
+
+    let request = GroqRequest {
+        model: "llama-3.3-70b-versatile".to_string(),
+        messages: vec![GroqChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+        response_format: GroqResponseFormat {
+            format_type: "json_schema".to_string(),
+            json_schema: GroqJsonSchema {
+                name: "download_estimate".to_string(),
+                strict: true,
+                schema,
+            },
+        },
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .ok()?;
+
+    let groq_resp: GroqResponse = response.json().await.ok()?;
+    let content = groq_resp.choices.first()?.message.content.clone();
+
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+        let estimated = parsed.get("estimated_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let range_min = parsed.get("range_min_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let range_max = parsed.get("range_max_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let conf = parsed.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let reasoning = parsed.get("reasoning").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+        Some((estimated, range_min, range_max, conf, reasoning))
+    } else {
+        None
+    }
+}
+
+// ── Native Win32 command-line reader (replaces PowerShell) ─────────────
+
+/// Simple 64-bit hash for deduplication (FNV-1a style).
+fn fxhash(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in s.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Read a process command line using native Win32 NtQueryInformationProcess.
+/// Reads the Process Environment Block (PEB) from the target process to get
+/// the RTL_USER_PROCESS_PARAMETERS.CommandLine UNICODE_STRING.
+/// Also returns the working directory (CurrentDirectory) from the same PEB.
+#[cfg(target_os = "windows")]
+fn read_process_cmdline_and_cwd(handle: *mut std::ffi::c_void) -> Option<(String, String)> {
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    struct UNICODE_STRING {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct CURDIR {
+        _dummy: *mut std::ffi::c_void,
+        path: UNICODE_STRING,
+    }
+
+    #[repr(C)]
+    struct RTL_USER_PROCESS_PARAMETERS {
+        maximum_length: u32,
+        length: u32,
+        flags: u32,
+        debug_flags: u32,
+        console_handle: HANDLE,
+        console_flags: u32,
+        std_input_handle: HANDLE,
+        std_output_handle: HANDLE,
+        std_error_handle: HANDLE,
+        current_directory: CURDIR,
+        image_path_name: UNICODE_STRING,
+        command_line: UNICODE_STRING,
+    }
+
+    #[repr(C)]
+    struct PEB {
+        reserved: [u8; 2],
+        being_debugged: u8,
+        _reserved1: [u8; 1],
+        _reserved2: [*mut std::ffi::c_void; 2],
+        _ldr: *mut std::ffi::c_void,
+        process_parameters: *mut RTL_USER_PROCESS_PARAMETERS,
+    }
+
+    #[repr(C)]
+    struct PROCESS_BASIC_INFORMATION {
+        exit_status: i32,
+        peb_base_address: *mut PEB,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    // NtQueryInformationProcess is in ntdll, ReadProcessMemory is in kernel32.
+    // Using separate extern blocks for each DLL to avoid link errors.
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: HANDLE,
+            information_class: u32,
+            information: *mut std::ffi::c_void,
+            information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ReadProcessMemory(
+            h_process: HANDLE,
+            lp_base_address: *const std::ffi::c_void,
+            lp_buffer: *mut std::ffi::c_void,
+            dw_size: usize,
+            lp_number_of_bytes_read: *mut usize,
+        ) -> i32;
+    }
+
+    /// Helper to read a UNICODE_STRING buffer from the target process.
+    unsafe fn read_ustr(handle: HANDLE, us: &UNICODE_STRING) -> Option<String> {
+        let len = us.length as usize;
+        if len == 0 || us.buffer.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; len / 2 + 1];
+        let mut bytes_read = 0usize;
+        let ret = ReadProcessMemory(
+            handle,
+            us.buffer as *const std::ffi::c_void,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            len,
+            &mut bytes_read,
+        );
+        if ret == 0 {
+            return None;
+        }
+        buf[len / 2] = 0;
+        Some(String::from_utf16_lossy(&buf[..len / 2]))
+    }
+
+    const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+
+    unsafe {
+        let mut pbi = std::mem::zeroed::<PROCESS_BASIC_INFORMATION>();
+        let mut ret_len = 0u32;
+
+        let status = NtQueryInformationProcess(
+            handle,
+            PROCESS_BASIC_INFORMATION_CLASS,
+            &mut pbi as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut ret_len,
+        );
+
+        if status != 0 || pbi.peb_base_address.is_null() {
+            return None;
+        }
+
+        // Read the PEB from the target process
+        let mut peb = std::mem::zeroed::<PEB>();
+        let mut bytes_read = 0usize;
+        ReadProcessMemory(
+            handle,
+            pbi.peb_base_address as *const std::ffi::c_void,
+            &mut peb as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<PEB>(),
+            &mut bytes_read,
+        );
+        if peb.process_parameters.is_null() {
+            return None;
+        }
+
+        // Read RTL_USER_PROCESS_PARAMETERS from the target process
+        let mut params = std::mem::zeroed::<RTL_USER_PROCESS_PARAMETERS>();
+        ReadProcessMemory(
+            handle,
+            peb.process_parameters as *const std::ffi::c_void,
+            &mut params as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<RTL_USER_PROCESS_PARAMETERS>(),
+            &mut bytes_read,
+        );
+
+        // Read command line and current directory from the target process
+        let cmdline = read_ustr(handle, &params.command_line)?;
+        let cwd = read_ustr(handle, &params.current_directory.path)
+            .unwrap_or_default();
+
+        Some((cmdline, cwd))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_process_cmdline_and_cwd(_handle: *mut std::ffi::c_void) -> Option<(String, String)> {
+    None
 }
 
 // ── Process classification ────────────────────────────────────────────────
@@ -690,20 +946,21 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
     let has_arg = |keyword: &str| lower_cmd.contains(keyword);
 
     // Helper: detect which package manager wraps around node.exe
+    // Returns None when the command line doesn't clearly match an operation.
     let pm_from_node_cmdline = || -> Option<CommandType> {
         if has_arg("pnpm") {
             if has_arg("install") || has_arg("add ") || has_arg("i ") { Some(CommandType::PnpmInstall) }
-            else { Some(CommandType::PnpmInstall) }
+            else { None }
         } else if has_arg("yarn") {
             if has_arg("install") || has_arg("add ") { Some(CommandType::YarnInstall) }
-            else { Some(CommandType::YarnInstall) }
+            else { None }
         } else if has_arg("npx") {
             Some(CommandType::NpxRun)
         } else if has_arg("npm") {
             if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci") { Some(CommandType::NpmInstall) }
-            else { Some(CommandType::NpmInstall) }
+            else { None }
         } else {
-            Some(CommandType::NpmInstall)
+            None
         }
     };
 
@@ -714,7 +971,7 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
             if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci") {
                 Some(CommandType::NpmInstall)
             } else {
-                Some(CommandType::NpmInstall)
+                None
             }
         }
         "pnpm.exe" | "pnpm" => Some(CommandType::PnpmInstall),
@@ -727,7 +984,7 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
             else if has_arg("build") || has_arg("compose build") { Some(CommandType::DockerBuild) }
             else if has_arg("compose") && !has_arg("build") { Some(CommandType::DockerCompose) }
             else if has_arg("pull") { Some(CommandType::DockerPull) }
-            else { Some(CommandType::DockerBuild) }
+            else { None }
         }
 
         // ── Git ──────────────────────────────────────────────────
@@ -735,20 +992,20 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
             if has_arg("clone") { Some(CommandType::GitClone) }
             else if has_arg("pull") { Some(CommandType::GitPull) }
             else if has_arg("fetch") { Some(CommandType::GitFetch) }
-            else { Some(CommandType::GitClone) }
+            else { None }
         }
 
         // ── VS Code ──────────────────────────────────────────────
         "code.exe" | "code" => {
             if has_arg("--install-extension") { Some(CommandType::VscodeExtInstall) }
             else if has_arg("--update-extensions") || has_arg("--list-extensions") { Some(CommandType::VscodeExtUpdate) }
-            else { Some(CommandType::VscodeExtInstall) }
+            else { None }
         }
 
         // ── Python / pip ─────────────────────────────────────────
         "pip.exe" | "pip" | "pip3.exe" | "pip3" => {
             if has_arg("install") { Some(CommandType::PipInstall) }
-            else { Some(CommandType::PipInstall) }
+            else { None }
         }
         "pipenv.exe" | "pipenv" => Some(CommandType::PipenvInstall),
         "poetry.exe" | "poetry" => Some(CommandType::PoetryInstall),
@@ -758,7 +1015,7 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
             if has_arg("install") { Some(CommandType::CargoInstall) }
             else if has_arg("build") || has_arg("b ") { Some(CommandType::CargoBuild) }
             else if has_arg("test") || has_arg("t ") { Some(CommandType::CargoTest) }
-            else { Some(CommandType::CargoBuild) }
+            else { None }
         }
         "rustc.exe" | "rustc" => Some(CommandType::CargoBuild),
 
@@ -776,7 +1033,7 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
         "dotnet.exe" | "dotnet" => {
             if has_arg("restore") { Some(CommandType::DotnetRestore) }
             else if has_arg("build") { Some(CommandType::DotnetBuild) }
-            else { Some(CommandType::DotnetRestore) }
+            else { None }
         }
 
         // ── Go ───────────────────────────────────────────────────
@@ -784,7 +1041,7 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
             if has_arg("mod download") || has_arg("mod tidy") { Some(CommandType::GoModDownload) }
             else if has_arg("install") { Some(CommandType::GoInstall) }
             else if has_arg("build") || has_arg("run") { Some(CommandType::GoBuild) }
-            else { Some(CommandType::GoModDownload) }
+            else { None }
         }
 
         // ── Java / JVM ───────────────────────────────────────────
@@ -841,8 +1098,11 @@ fn extract_package_name(cmd_type: &CommandType, cmdline: &str) -> String {
 
 // ── Background scanner thread ─────────────────────────────────────────────
 
-/// Start the background process scanner. Periodically polls the process table
-/// and stores newly detected operations in the engine.
+/// Start the background process scanner in a new thread. Periodically polls the
+/// process table and stores newly detected operations in the engine.
+///
+/// A shared `AtomicBool` stop signal is stored in the engine so that
+/// `stop_scanner` can request clean shutdown.
 ///
 /// When a new operation is detected, a "sandbox-operation-detected" Tauri event
 /// is emitted with the operation payload.
@@ -850,15 +1110,31 @@ pub fn start_scanner(
     engine: Arc<Mutex<SandboxEngine>>,
     app_handle: Option<tauri::AppHandle>,
 ) {
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop_signal);
+
+    // Store the stop signal in the engine so stop_scanner can access it
+    if let Ok(mut eng) = engine.lock() {
+        eng.set_stop_signal(stop_signal);
+        eng.is_running = true;
+    }
+
     std::thread::spawn(move || {
         log::info!("Sandbox process scanner started");
+
         loop {
+            // Check for stop signal
+            if thread_stop.load(Ordering::Relaxed) {
+                log::info!("Sandbox scanner stop requested — shutting down");
+                if let Ok(mut eng) = engine.lock() {
+                    eng.is_running = false;
+                }
+                return;
+            }
+
             let new_ops = {
                 match engine.lock() {
-                    Ok(mut eng) => {
-                        eng.is_running = true;
-                        eng.scan()
-                    }
+                    Ok(mut eng) => eng.scan(),
                     Err(e) => {
                         log::error!("Sandbox engine mutex poisoned: {e}");
                         Vec::new()
@@ -875,39 +1151,75 @@ pub fn start_scanner(
                 }
             }
 
-            // For new operations, estimate download sizes synchronously.
-            // local_estimate() is a cheap match — no async needed.
+            // ── Estimate download sizes for new operations ──────────────
+            // Strategy: always compute local estimates first, then try to
+            // overwrite with Groq AI if the key is configured. This avoids
+            // tricky async-in-sync-thread control flow (see: the break bug).
             if !new_ops.is_empty() {
-                // Brief pause to let the process settle
                 std::thread::sleep(Duration::from_millis(300));
 
-                // Collect estimates first to avoid borrow conflict
+                // Collect ops to estimate + groq key (brief lock, released before async)
+                let (ops_to_estimate, groq_api_key) = {
+                    if let Ok(eng) = engine.lock() {
+                        let ops = eng.detected_operations.iter()
+                            .filter(|op| op.status == "detected")
+                            .cloned()
+                            .collect();
+                        (ops, eng.groq_api_key_ref().map(|s| s.to_string()))
+                    } else {
+                        (Vec::new(), None)
+                    }
+                };
+
+                if ops_to_estimate.is_empty() {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+
+                // ── Phase 1: local estimates for everything (baseline) ──
                 let mut estimates: Vec<(String, f64, f64, f64, f64, String)> = Vec::new();
-                if let Ok(eng) = engine.lock() {
-                    for op in &eng.detected_operations {
-                        if op.status == "detected" {
-                            let (est, rmin, rmax, conf, reasoning) = eng.local_estimate(&op.command_type);
-                            estimates.push((op.id.clone(), est, rmin, rmax, conf, reasoning));
+                for op in &ops_to_estimate {
+                    let (est, rmin, rmax, conf, reasoning) =
+                        SandboxEngine::local_estimate(&op.command_type);
+                    estimates.push((op.id.clone(), est, rmin, rmax, conf, reasoning));
+                }
+
+                // ── Phase 2: try Groq AI on top if key is available ────
+                if let Some(ref api_key) = groq_api_key {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        for op in &ops_to_estimate {
+                            if let Some((est, rmin, rmax, conf, reasoning)) =
+                                rt.block_on(groq_predict(api_key, op))
+                            {
+                                log::info!("Groq estimate for {}: {:.1} MB (confidence {:.0}%)",
+                                    op.command_type.label(), est, conf * 100.0);
+                                if let Some(entry) = estimates.iter_mut().find(|(id, _, _, _, _, _)| id == &op.id) {
+                                    *entry = (op.id.clone(), est, rmin, rmax, conf, reasoning);
+                                }
+                            } else {
+                                log::warn!("Groq estimation failed for {}, keeping local estimate",
+                                    op.command_type.label());
+                            }
                         }
+                    } else {
+                        log::warn!("Failed to create Tokio runtime for Groq; using local estimates");
                     }
                 }
 
-                // Apply estimates and emit events
-                if !estimates.is_empty() {
-                    if let Ok(mut eng) = engine.lock() {
-                        for (id, est, rmin, rmax, conf, reasoning) in &estimates {
-                            if let Some(op) = eng.detected_operations.iter_mut().find(|o| o.id == *id) {
-                                op.estimated_mb = *est;
-                                op.estimated_range_min_mb = *rmin;
-                                op.estimated_range_max_mb = *rmax;
-                                op.confidence = *conf;
-                                op.ai_reasoning = reasoning.clone();
-                                op.status = "estimated".to_string();
+                // ── Apply estimates & emit events ───────────────────────
+                if let Ok(mut eng) = engine.lock() {
+                    for (id, est, rmin, rmax, conf, reasoning) in &estimates {
+                        if let Some(op) = eng.detected_operations.iter_mut().find(|o| o.id == *id) {
+                            op.estimated_mb = *est;
+                            op.estimated_range_min_mb = *rmin;
+                            op.estimated_range_max_mb = *rmax;
+                            op.confidence = *conf;
+                            op.ai_reasoning = reasoning.clone();
+                            op.status = "estimated".to_string();
 
-                                if let Some(ref handle) = app_handle {
-                                    if let Ok(payload) = serde_json::to_value(&*op) {
-                                        let _ = handle.emit("sandbox-operation-updated", payload);
-                                    }
+                            if let Some(ref handle) = app_handle {
+                                if let Ok(payload) = serde_json::to_value(&*op) {
+                                    let _ = handle.emit("sandbox-operation-updated", payload);
                                 }
                             }
                         }
@@ -915,7 +1227,30 @@ pub fn start_scanner(
                 }
             }
 
-            std::thread::sleep(Duration::from_secs(2));
+            // Throttle: sleep 2 s between scans (check stop signal during sleep)
+            for _ in 0..20 {
+                if thread_stop.load(Ordering::Relaxed) {
+                    log::info!("Sandbox scanner stop requested during sleep — shutting down");
+                    if let Ok(mut eng) = engine.lock() {
+                        eng.is_running = false;
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     });
+}
+
+/// Request the background scanner thread to stop.
+/// Sets the stop signal; the thread will exit on its next iteration.
+pub fn stop_scanner(engine: &Arc<Mutex<SandboxEngine>>) {
+    if let Ok(mut eng) = engine.lock() {
+        if let Some(signal) = eng.take_stop_signal() {
+            signal.store(true, Ordering::Relaxed);
+            log::info!("Sandbox scanner stop signal sent");
+        } else {
+            log::warn!("stop_scanner called but no stop signal found (scanner not running?)");
+        }
+    }
 }

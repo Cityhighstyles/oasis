@@ -3,14 +3,14 @@ import {
   FlaskConical,
   Play,
   Square,
-  Clock,
   Terminal,
   Package,
   Container,
   GitBranch,
   Puzzle,
-  Snake,
-  Crab,
+  FileCode,
+  Cog,
+  Folder,
   Download,
   Bot,
   HardHat,
@@ -25,19 +25,20 @@ import {
   Scan,
   Loader2,
   Info,
-  ArrowUpRight,
+  Lock,
+  PlayCircle,
 } from "lucide-react"
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Separator } from "@/components/ui/separator"
 import { Input } from "@/components/ui/input"
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useShield } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
 import { invoke } from "@tauri-apps/api/core"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
+import { toast } from "sonner"
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Types
@@ -80,8 +81,8 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   container: Container,
   "git-branch": GitBranch,
   puzzle: Puzzle,
-  snake: Snake,
-  crab: Crab,
+  snake: FileCode,
+  crab: Cog,
   download: Download,
   bot: Bot,
   "hard-hat": HardHat,
@@ -92,43 +93,11 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   terminal: Terminal,
 }
 
-const COMMAND_COLORS: Record<string, string> = {
-  "npm install": "neon-emerald",
-  "pnpm install": "neon-emerald",
-  "yarn install": "neon-emerald",
-  "npx run": "emerald-300",
-  "docker pull": "neon-cyan",
-  "docker build": "neon-cyan",
-  "docker compose": "cyan-300",
-  "git clone": "blue-400",
-  "git pull": "blue-300",
-  "git fetch": "blue-200",
-  "VS Code Extension Install": "purple-400",
-  "VS Code Extension Update": "purple-300",
-  "pip install": "amber-400",
-  "pipenv install": "amber-300",
-  "poetry install": "amber-200",
-  "cargo install": "orange-400",
-  "cargo build": "orange-400",
-  "cargo test": "orange-300",
-  "winget install": "sky-400",
-  "choco install": "red-400",
-  "scoop install": "green-400",
-  "brew install": "pink-400",
-  "apt-get install": "yellow-500",
-  "nuget install": "indigo-400",
-  "dotnet restore": "indigo-300",
-  "dotnet build": "indigo-400",
-  "go mod download": "teal-400",
-  "go install": "teal-300",
-  "go build": "teal-400",
-  "maven build": "yellow-400",
-  "Gradle build": "yellow-400",
-  "Android Studio Download": "lime-400",
-}
+// Color map removed — icons and status badges provide sufficient visual cues.
+// See COMMAND_COLORS in git history if per-label colors are needed later.
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Duration options (preserved from existing)
+// Duration options
 // ══════════════════════════════════════════════════════════════════════════════
 
 const DURATIONS = [
@@ -144,7 +113,7 @@ const DURATIONS = [
 export function DevSandbox() {
   const { isShieldActive } = useShield()
 
-  // ── Timer state (preserved from existing) ───────────────────────────────
+  // ── Timer state ───────────────────────────────
   const [selectedDuration, setSelectedDuration] = useState(DURATIONS[0])
   const [isPaused, setIsPaused] = useState(false)
   const [timeLeft, setTimeLeft] = useState(0)
@@ -157,9 +126,12 @@ export function DevSandbox() {
   const [groqKeyInput, setGroqKeyInput] = useState("")
   const [showGroqInput, setShowGroqInput] = useState(false)
   const [isScanning, setIsScanning] = useState(false)
+  const [isLoading, setIsLoading] = useState(true)
   const [overlayWindows, setOverlayWindows] = useState<Set<string>>(new Set())
+  const [autoScroll, setAutoScroll] = useState(true)
 
   const logRef = useRef<HTMLDivElement>(null)
+  const operationsContainerRef = useRef<HTMLDivElement>(null)
   const operationsEndRef = useRef<HTMLDivElement>(null)
 
   const totalSeconds = selectedDuration.seconds
@@ -212,7 +184,11 @@ export function DevSandbox() {
         const ops: DetectedOperation[] = await invoke("get_sandbox_operations")
         setOperations(ops)
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
         console.error("Failed to poll sandbox status:", err)
+        toast.error("Sandbox status poll failed", { description: msg })
+      } finally {
+        setIsLoading(false)
       }
     }
 
@@ -221,10 +197,30 @@ export function DevSandbox() {
     return () => clearInterval(interval)
   }, [])
 
-  // ── Auto-scroll operations ──────────────────────────────────────────────
+  // ── Auto-scroll operations (on by default; pauses if user scrolls up) ────
   useEffect(() => {
-    operationsEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [operations])
+    if (autoScroll) {
+      const container = operationsContainerRef.current
+      if (container) {
+        const isNearBottom =
+          container.scrollHeight - container.scrollTop - container.clientHeight < 50
+        if (isNearBottom) {
+          operationsEndRef.current?.scrollIntoView({ behavior: "smooth" })
+        }
+      }
+    }
+  }, [operations, autoScroll])
+
+  // ── Handle manual scroll to pause auto-follow ───────────────────────────
+  const handleOperationsScroll = useCallback(() => {
+    const container = operationsContainerRef.current
+    if (!container) return
+    const isNearBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 50
+    if (!isNearBottom && autoScroll) {
+      setAutoScroll(false)
+    }
+  }, [autoScroll])
 
   // ── Auto-scroll log ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -233,19 +229,37 @@ export function DevSandbox() {
     }
   }, [logLines])
 
-  // ── Timer handlers (preserved) ──────────────────────────────────────────
+  // ── Timer handlers (auto-control scanner) ────────────────────────────
   const startPause = () => {
     if (!isShieldActive) return
     setIsPaused(true)
     setTimeLeft(selectedDuration.seconds)
     setLogLines((prev) => [...prev, "Pausing WFP kernel filters..."])
     setTimeout(() => setLogLines((prev) => [...prev, "Sandbox mode ACTIVE — shield suspended"]), 400)
-    setTimeout(() => setLogLines((prev) => [...prev, "Process scanner running — watching for commands..."]), 800)
+    // Auto-start scanner if not already running
+    if (!isScanning) {
+      invoke("start_sandbox_scanner").then(() => {
+        setIsScanning(true)
+        setLogLines((prev) => [...prev, "Scanner auto-started — watching for developer commands..."])
+      }).catch((err) => {
+        console.error("Failed to auto-start scanner:", err)
+      })
+    } else {
+      setTimeout(() => setLogLines((prev) => [...prev, "Process scanner already running — watching for commands..."]), 800)
+    }
   }
 
   const stopPause = () => {
     setIsPaused(false)
     setTimeLeft(0)
+    // Auto-stop scanner when shield is restored
+    if (isScanning) {
+      invoke("stop_sandbox_scanner").then(() => {
+        setIsScanning(false)
+      }).catch((err) => {
+        console.error("Failed to auto-stop scanner:", err)
+      })
+    }
     setLogLines((prev) => [...prev, "Shield restored — all rules re-applied."])
     if (intervalRef.current) clearInterval(intervalRef.current)
   }
@@ -268,16 +282,54 @@ export function DevSandbox() {
     }
   }, [isPaused])
 
-  // ── Sandbox actions ────────────────────────────────────────────────────
-  const clearOperations = async () => {
+  // ── Toggle scanner on/off ──────────────────────────────────────────────
+  const [scannerLoading, setScannerLoading] = useState(false)
+
+  const toggleScanner = useCallback(async () => {
+    if (scannerLoading) return
+    setScannerLoading(true)
+    try {
+      if (isScanning) {
+        await invoke("stop_sandbox_scanner")
+        setIsScanning(false)
+        setLogLines((prev) => [...prev, "Scanner stopped."])
+      } else {
+        await invoke("start_sandbox_scanner")
+        setIsScanning(true)
+        setLogLines((prev) => [...prev, "Scanner started — watching for developer commands..."])
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error("Failed to toggle scanner:", err)
+      toast.error("Scanner toggle failed", { description: msg })
+    } finally {
+      setScannerLoading(false)
+    }
+  }, [isScanning, scannerLoading])
+
+  // ── Sandbox actions (Memoized with useCallback) ────────────────────────
+  const clearOperations = useCallback(async () => {
     try {
       await invoke("clear_sandbox_operations")
       setOperations([])
       setLogLines((prev) => [...prev, "Operation history cleared."])
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
       console.error("Failed to clear operations:", err)
+      toast.error("Failed to clear operations", { description: msg })
     }
-  }
+  }, [])
+
+  const openOverlay = useCallback(async (opId: string) => {
+    try {
+      await invoke("create_sandbox_overlay", { operationId: opId })
+      setOverlayWindows((prev) => new Set(prev).add(opId))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error("Failed to open overlay:", err)
+      toast.error("Failed to open overlay", { description: msg })
+    }
+  }, [])
 
   const setGroqKey = async () => {
     if (!groqKeyInput.trim()) return
@@ -287,23 +339,10 @@ export function DevSandbox() {
       setGroqKeyInput("")
       setLogLines((prev) => [...prev, "Groq AI API key configured — AI estimates enabled."])
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
       console.error("Failed to set Groq API key:", err)
+      toast.error("Failed to set API key", { description: msg })
     }
-  }
-
-  const openOverlay = async (opId: string) => {
-    try {
-      await invoke("create_sandbox_overlay", { operationId: opId })
-      setOverlayWindows((prev) => new Set(prev).add(opId))
-    } catch (err) {
-      console.error("Failed to open overlay:", err)
-    }
-  }
-
-  // ── Helpers ─────────────────────────────────────────────────────────────
-  const getColorClass = (label: string) => {
-    const color = COMMAND_COLORS[label] || "muted-foreground"
-    return color
   }
 
   const ringColor = timeLeft > 300 ? "#10b981" : timeLeft > 60 ? "#f59e0b" : "#ef4444"
@@ -359,7 +398,6 @@ export function DevSandbox() {
         {/* LEFT COLUMN: Timer + Controls */}
         {/* ═══════════════════════════════════════════════════════════════ */}
         <div className="col-span-12 lg:col-span-4 space-y-4">
-          {/* Big timer display (preserved from existing) */}
           <Card
             className={cn(
               "border transition-all duration-500",
@@ -534,30 +572,35 @@ export function DevSandbox() {
           <div
             className={cn(
               "flex items-center gap-3 rounded-lg border px-4 py-3 transition-all duration-300",
-              isPaused
-                ? "border-amber-500/30 bg-amber-500/5"
-                : isShieldActive
-                  ? "border-neon-emerald/20 bg-neon-emerald/5"
-                  : "border-border bg-card"
+              isScanning
+                ? "border-neon-emerald/20 bg-neon-emerald/5"
+                : "border-border bg-card"
             )}
           >
-            {isPaused ? (
-              <Clock className="size-4 text-amber-400 shrink-0" />
+            {isScanning ? (
+              <Scan className="size-4 text-neon-emerald shrink-0 animate-pulse" />
             ) : (
-              <CheckCircle2 className={cn("size-4 shrink-0", isShieldActive ? "text-neon-emerald" : "text-muted-foreground")} />
+              <CheckCircle2 className="size-4 text-muted-foreground shrink-0" />
             )}
             <div className="flex-1 min-w-0">
-              <p className={cn("text-xs font-medium", isPaused ? "text-amber-400" : isShieldActive ? "text-neon-emerald" : "text-muted-foreground")}>
-                {isPaused ? `Shield paused — ${minutes}m ${seconds}s remaining` : isShieldActive ? "Shield active — scanner running" : "Shield inactive"}
+              <p className={cn("text-xs font-medium", isScanning ? "text-neon-emerald" : "text-muted-foreground")}>
+                {isScanning ? "Scanner Active" : "Scanner Off"}
               </p>
               <p className="text-[10px] text-muted-foreground">
                 {isScanning
-                  ? `Watching for developer commands...`
-                  : "Scanner not running"}
+                  ? `Watching for developer commands`
+                  : isShieldActive && !isPaused
+                    ? "Start scanner to detect operations"
+                    : isPaused
+                      ? "Scanner paused — resume shield"
+                      : "Enable shield to use scanner"}
               </p>
             </div>
-            <div className="flex gap-1">
-              <Scan className={cn("size-3.5", isScanning ? "text-neon-emerald animate-pulse" : "text-muted-foreground")} />
+            <div className="text-right shrink-0">
+              <p className="text-[9px] text-muted-foreground">Detected</p>
+              <p className={cn("text-xs font-bold tabular-nums", isScanning ? "text-neon-emerald" : "text-muted-foreground")}>
+                {operations.length}
+              </p>
             </div>
           </div>
         </div>
@@ -576,6 +619,49 @@ export function DevSandbox() {
             </div>
             <div className="flex gap-2">
               <Button
+                variant={autoScroll ? "default" : "outline"}
+                size="sm"
+                className={cn(
+                  "h-7 text-[10px] border-border",
+                  autoScroll
+                    ? "bg-neon-emerald/20 text-neon-emerald border-neon-emerald/30 hover:bg-neon-emerald/30"
+                    : ""
+                )}
+                onClick={() => {
+                  setAutoScroll(!autoScroll)
+                  if (!autoScroll) {
+                    setTimeout(
+                      () => operationsEndRef.current?.scrollIntoView({ behavior: "smooth" }),
+                      0
+                    )
+                  }
+                }}
+              >
+                <Lock className={cn("size-3 mr-1", autoScroll ? "" : "opacity-50")} />
+                {autoScroll ? "Auto-Scroll On" : "Auto-Scroll Off"}
+              </Button>
+              {/* Scanner toggle */}
+              <Button
+                variant={isScanning ? "default" : "outline"}
+                size="sm"
+                className={cn(
+                  "h-7 text-[10px] border-border",
+                  isScanning
+                    ? "bg-neon-emerald/20 text-neon-emerald border-neon-emerald/30 hover:bg-neon-emerald/30"
+                    : "text-muted-foreground"
+                )}
+                onClick={toggleScanner}
+                disabled={scannerLoading}
+              >
+                {scannerLoading ? (
+                  <><Loader2 className="size-3 mr-1 animate-spin" /></>
+                ) : isScanning ? (
+                  <><Square className="size-3 mr-1" /> Stop Scanner</>
+                ) : (
+                  <><PlayCircle className="size-3 mr-1" /> Start Scanner</>
+                )}
+              </Button>
+              <Button
                 variant="outline"
                 size="sm"
                 className="h-7 text-[10px] border-border"
@@ -589,8 +675,28 @@ export function DevSandbox() {
           </div>
 
           {/* Operations feed */}
-          <div className="space-y-2 max-h-[400px] overflow-y-auto pr-1 scrollbar-thin">
-            {operations.length === 0 ? (
+          <div 
+            ref={operationsContainerRef}
+            onScroll={handleOperationsScroll}
+            className="space-y-2 max-h-[400px] overflow-y-auto pr-1 scrollbar-thin"
+          >
+            {isLoading ? (
+              // Loading skeleton — prevents empty flash while backend responds
+              <div className="space-y-2">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="rounded-lg border border-border bg-card/50 p-3 animate-pulse">
+                    <div className="flex items-start gap-3">
+                      <div className="size-9 rounded-lg bg-muted shrink-0" />
+                      <div className="flex-1 space-y-2">
+                        <div className="h-3 w-24 rounded bg-muted" />
+                        <div className="h-2 w-48 rounded bg-muted/60" />
+                        <div className="h-2 w-32 rounded bg-muted/40" />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : operations.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 rounded-lg border border-dashed border-border">
                 <Scan className="size-8 text-muted-foreground/30 mb-3" />
                 <p className="text-xs text-muted-foreground/60">No operations detected yet</p>
@@ -604,8 +710,9 @@ export function DevSandbox() {
               operations.map((op) => {
                 const Icon = ICON_MAP[op.commandType.icon] || Terminal
                 const isEstimated = op.status === "estimated"
-                const colorClass = getColorClass(op.commandType.label)
                 const isOverlayOpen = overlayWindows.has(op.id)
+                const hasPackage = op.packageName && op.packageName.length > 0
+                const hasWorkingDir = op.workingDir && op.workingDir.length > 0
 
                 return (
                   <div
@@ -652,37 +759,34 @@ export function DevSandbox() {
                               {isEstimated ? "Estimated" : "Detecting"}
                             </span>
                           </div>
-                          <div className="flex items-center gap-2 mt-0.5">
+                          <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                             <span className="text-[9px] font-mono text-muted-foreground">
                               PID {op.pid}
                             </span>
                             <span className="text-[9px] text-muted-foreground/40">·</span>
-                            <span className="text-[9px] font-mono text-muted-foreground truncate">
+                            <span className="text-[9px] font-mono text-muted-foreground truncate max-w-[120px]">
                               {op.executable}
                             </span>
                             <span className="text-[9px] text-muted-foreground/40">·</span>
                             <span className="text-[9px] text-muted-foreground">{op.detectedAt}</span>
+                            {hasPackage && (
+                              <>
+                                <span className="text-[9px] text-muted-foreground/40">·</span>
+                                <span className="text-[9px] font-mono text-muted-foreground truncate max-w-[100px]">
+                                  <Package className="size-2.5 inline mr-0.5 -mt-0.5" />
+                                  {op.packageName}
+                                </span>
+                              </>
+                            )}
                           </div>
-                        </div>
-                        <div className="flex items-center gap-1 shrink-0">
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="size-7 hover:bg-neon-emerald/10 hover:text-neon-emerald opacity-0 group-hover:opacity-100 transition-opacity"
-                                  onClick={() => openOverlay(op.id)}
-                                  disabled={isOverlayOpen}
-                                >
-                                  <ArrowUpRight className="size-3.5" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent side="left" className="text-[10px]">
-                                {isOverlayOpen ? "Overlay already open" : "Open overlay window"}
-                              </TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
+                          {hasWorkingDir && (
+                            <div className="flex items-center gap-1 mt-0.5">
+                              <span className="text-[8px] font-mono text-muted-foreground/40 truncate max-w-full" title={op.workingDir}>
+                                <Folder className="size-2.5 inline mr-0.5 -mt-0.5" />
+                                {op.workingDir}
+                              </span>
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -791,13 +895,16 @@ export function DevSandbox() {
                 className="h-40 overflow-auto bg-background/80 p-4 font-mono text-xs"
               >
                 {logLines.length === 0 ? (
-                  <span className="text-muted-foreground/40">
-                    {">"} Awaiting sandbox activation...
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <ChevronRight className="size-3 text-muted-foreground/40 shrink-0" />
+                    <span className="text-muted-foreground/40">
+                      Awaiting sandbox activation...
+                    </span>
+                  </div>
                 ) : (
                   logLines.map((line, i) => (
                     <div key={i} className="flex gap-2 mb-1">
-                      <span className="text-muted-foreground/40 shrink-0">{">"}</span>
+                      <ChevronRight className="size-3 text-muted-foreground/40 shrink-0 mt-0.5" />
                       <span
                         className={cn(
                           "transition-colors",

@@ -45,9 +45,6 @@ pub fn run() {
         }
     }
 
-    // ── Capture AppHandle for sandbox event emission ────────────────────────
-    let sandbox_for_scanner = Arc::clone(&sandbox_engine);
-
     // ── Start the background polling task ───────────────────────────────────
     engine::start_polling_task(Arc::clone(&engine));
 
@@ -64,8 +61,9 @@ pub fn run() {
                 )?;
             }
 
-            // Start the sandbox process scanner with the app handle for events
-            sandbox::start_scanner(sandbox_for_scanner, Some(app.handle().clone()));
+            // Note: sandbox scanner is NOT auto-started here.
+            // The frontend calls start_sandbox_scanner / stop_sandbox_scanner
+            // commands to control when the background process scanner runs.
 
             Ok(())
         })
@@ -91,6 +89,8 @@ pub fn run() {
             commands::create_sandbox_overlay,
             commands::close_sandbox_overlay,
             commands::get_sandbox_status,
+            commands::start_sandbox_scanner,
+            commands::stop_sandbox_scanner,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
