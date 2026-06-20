@@ -9,6 +9,7 @@ use tauri::State;
 #[cfg(target_os = "windows")]
 use crate::procctl;
 use crate::engine::{NetworkEngine, ProcessEntry};
+use crate::rules::Rule;
 
 /// Managed state type registered with Tauri.
 pub struct AppState(pub Arc<Mutex<NetworkEngine>>);
@@ -145,4 +146,86 @@ pub fn get_suspended_pids(state: State<'_, AppState>) -> Vec<u32> {
         let _ = &state;
         vec![]
     }
+}
+
+// ═══════════════════════════ Rules Commands ═══════════════════════════════════
+
+/// Returns all tracked rules, ordered by the canonical display order.
+#[tauri::command]
+pub fn get_rules(state: State<'_, AppState>) -> Result<Vec<Rule>, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    Ok(engine.rules_manager.get_all_rules())
+}
+
+/// Toggle a rule's active state, rebuild the block index cache, and persist.
+///
+/// The front-end applies an optimistic UI pattern before calling this command;
+/// on error the caller should rollback the optimistic state.
+#[tauri::command]
+pub fn toggle_rule_state(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.rules_manager.toggle_rule(&id, enabled)
+}
+
+/// Set the master shield active state on the engine.
+/// This controls whether the AutoBlockRegistry filters are enforced during polling.
+#[tauri::command]
+pub fn set_shield_active(
+    active: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.set_shield_active(active);
+    Ok(())
+}
+
+/// Add a new custom rule with the given name, description, risk, and targets.
+/// Returns the newly created `Rule` (with generated id).
+#[tauri::command]
+pub fn add_rule(
+    name: String,
+    description: String,
+    risk: String,
+    targets: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Rule, String> {
+    let risk_enum = match risk.to_lowercase().as_str() {
+        "high" => crate::rules::Risk::High,
+        "medium" => crate::rules::Risk::Medium,
+        "low" => crate::rules::Risk::Low,
+        _ => return Err(format!("Invalid risk level '{risk}'. Use 'high', 'medium', or 'low'")),
+    };
+
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.rules_manager.add_rule(name, description, risk_enum, targets)
+}
+
+/// Delete a rule by id. Rebuilds the registry and persists.
+/// Returns the deleted rule for confirmation.
+#[tauri::command]
+pub fn delete_rule(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Rule, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.rules_manager.delete_rule(&id)
 }

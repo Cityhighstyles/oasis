@@ -14,6 +14,16 @@ export type ProcessEntry = {
   lastSeen: string
 }
 
+export type Rule = {
+  id: string
+  name: string
+  description: string
+  enabled: boolean
+  risk: "high" | "medium" | "low"
+  targets: string[]
+  dataBlockedBytes: number
+}
+
 type ShieldContextType = {
   isShieldActive: boolean
   toggleShield: () => void
@@ -32,6 +42,20 @@ type ShieldContextType = {
   resumeProcess: (pid: number) => Promise<number>
   killProcess: (pid: number) => Promise<void>
   suspendedPids: Set<number>
+  // ── Rules system ────────────────────────────────────────────────────
+  rules: Rule[]
+  refreshRules: () => Promise<void>
+  /**
+   * Toggle a rule&#x27;s enabled state with an optimistic UI pattern:
+   * 1. Immediately updates the local rules state optimistically.
+   * 2. Calls the backend IPC command.
+   * 3. On failure, reverts to the previous state.
+   */
+  toggleRule: (id: string, enabled: boolean) => Promise<void>
+  /** Add a new custom rule and refresh the list. */
+  addRule: (name: string, description: string, risk: string, targets: string[]) => Promise<void>
+  /** Delete a rule by id and refresh the list. */
+  deleteRule: (id: string) => Promise<void>
 }
 
 const ShieldContext = createContext<ShieldContextType | null>(null)
@@ -45,6 +69,39 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   const [wfpAvailable, setWfpAvailable] = useState(false)
   const [processes, setProcesses] = useState<ProcessEntry[]>([])
   const [suspendedPids, setSuspendedPids] = useState<Set<number>>(new Set())
+
+  // ── Rules state ───────────────────────────────────────────────────────
+  const [rules, setRules] = useState<Rule[]>([])
+
+  const refreshRules = useCallback(async () => {
+    try {
+      const data: Rule[] = await invoke("get_rules")
+      setRules(data)
+    } catch (err) {
+      console.error("Failed to fetch rules:", err)
+    }
+  }, [])
+
+  const toggleRule = useCallback(
+    async (id: string, enabled: boolean) => {
+      // 1. Optimistic update — flip immediately in local state
+      const previous = rules
+      setRules((prev) =>
+        prev.map((r) => (r.id === id ? { ...r, enabled } : r))
+      )
+
+      try {
+        // 2. Send the toggle to the Rust backend
+        await invoke("toggle_rule_state", { id, enabled })
+      } catch (err) {
+        // 3. Revert on IPC failure
+        setRules(previous)
+        console.error(`Failed to toggle rule "${id}":`, err)
+        throw err
+      }
+    },
+    [rules]
+  )
 
   const refreshProcesses = useCallback(async () => {
     try {
@@ -115,21 +172,47 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     await refreshProcesses()
   }, [refreshProcesses])
 
-  const toggleShield = useCallback(() => {
-    setIsShieldActive((prev) => !prev)
-  }, [])
+  const deleteRule = useCallback(
+    async (id: string) => {
+      await invoke("delete_rule", { id })
+      await refreshRules()
+    },
+    [refreshRules]
+  )
+
+  const addRule = useCallback(
+    async (name: string, description: string, risk: string, targets: string[]) => {
+      await invoke("add_rule", { name, description, risk, targets })
+      await refreshRules()
+    },
+    [refreshRules]
+  )
+
+  const toggleShield = useCallback(async () => {
+    const newState = !isShieldActive
+    setIsShieldActive(newState)
+    // Sync shield state to the Rust backend so the engine can enforce
+    // or release AutoBlockRegistry filters during its poll loop.
+    try {
+      await invoke("set_shield_active", { active: newState })
+    } catch (err) {
+      console.error("Failed to sync shield state:", err)
+      setIsShieldActive(!newState) // revert on failure
+    }
+  }, [isShieldActive])
 
   useEffect(() => {
     refreshWfpStatus()
     refreshProcesses()
     refreshSuspendedPids()
+    refreshRules()
 
     const interval = setInterval(() => {
       refreshProcesses()
     }, 2000)
 
     return () => clearInterval(interval)
-  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids])
+  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids, refreshRules])
 
   const blockedCount = processes.filter((p) => p.status === "blocked").length
   const blockedApps = processes.filter((p) => p.status === "blocked")
@@ -154,6 +237,11 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         resumeProcess,
         killProcess,
         suspendedPids,
+        rules,
+        refreshRules,
+        toggleRule,
+        addRule,
+        deleteRule,
       }}
     >
       {children}

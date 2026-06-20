@@ -14,12 +14,14 @@
 //!    to call a single WFP API.
 //!  - `WfpEngine` is `Send + Sync` (see wfp.rs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+
+use crate::rules::RulesManager;
 
 #[cfg(target_os = "windows")]
 use crate::iphelper::{self, ProcessNetStats};
@@ -107,6 +109,13 @@ struct ProcessAccumulator {
 
 pub struct NetworkEngine {
     pub wfp: WfpEngine,
+    /// The RulesManager managing all rules and the AutoBlockRegistry.
+    pub rules_manager: RulesManager,
+    /// Whether the master shield is currently active (synced from frontend).
+    pub is_shield_active: bool,
+    /// Tracks auto-blocked executable paths: lowercase key → original path.
+    /// Used so we can drain and unblock every filter when the shield is deactivated.
+    auto_blocked_paths: HashMap<String, String>,
     /// Latest snapshot of process entries (replaced atomically each tick).
     entries: Vec<ProcessEntry>,
     /// Historical per-exe-path metadata for dormant process preservation.
@@ -125,6 +134,9 @@ impl NetworkEngine {
     pub fn new() -> Self {
         NetworkEngine {
             wfp: WfpEngine::new(),
+            rules_manager: RulesManager::new(),
+            is_shield_active: true,
+            auto_blocked_paths: HashMap::new(),
             entries: Vec::new(),
             accumulators: HashMap::new(),
             per_pid_cumulative: HashMap::new(),
@@ -132,6 +144,61 @@ impl NetworkEngine {
             last_io_other_bytes: HashMap::new(),
             #[cfg(target_os = "windows")]
             suspended_pids: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Set the master shield active state.
+    /// When deactivating, drain all auto-blocked paths and unblock every
+    /// WFP filter that was installed by the AutoBlockRegistry.
+    pub fn set_shield_active(&mut self, active: bool) {
+        self.is_shield_active = active;
+        if !active {
+            for (_lower, original) in self.auto_blocked_paths.drain() {
+                if let Err(e) = self.wfp.unblock_app(&original) {
+                    log::warn!("Shield deactivation cleanup failed for {}: {e}", original);
+                }
+            }
+        }
+    }
+
+    /// Auto-install or remove WFP filters for every active process based on the
+    /// AutoBlockRegistry. Called once per poll tick before building process entries.
+    ///
+    /// Uses a deduplicated set of executable paths so that multi-process
+    /// applications (e.g. Chrome with many child processes sharing the same
+    /// binary) only trigger a single `wfp.block_app()` call, avoiding the
+    /// `FWP_E_ALREADY_EXISTS` (0x80320007) log spam.
+    ///
+    /// - If a process&#x27;s exe name is in the registry **and** the shield is active
+    ///   **and** it isn&#x27;t already WFP-blocked → install a BLOCK filter via `wfp.block_app()`.
+    /// - If a process was previously auto-blocked but no longer matches → remove the filter.
+    fn sync_auto_block_filters(&mut self, stats_map: &HashMap<u32, ProcessNetStats>) {
+        // Deduplicate by executable path first — multiple PIDs can share the same binary
+        let unique_paths: HashSet<&String> = stats_map.values().map(|s| &s.exe_path).collect();
+
+        for exe_path in unique_paths {
+            let exe_name = get_exe_name(exe_path);
+            let exe_path_lower = exe_path.to_lowercase();
+            let should_block = self.is_shield_active
+                && self.rules_manager.is_target_blocked(&exe_name);
+
+            if should_block {
+                if !self.wfp.is_blocked(exe_path) {
+                    if let Err(e) = self.wfp.block_app(exe_path) {
+                        log::warn!("Auto-block failed for {exe_path}: {e}");
+                    } else {
+                        // Store mapping: lowercase key → original path for cleanup
+                        self.auto_blocked_paths.insert(exe_path_lower, exe_path.to_string());
+                    }
+                }
+            } else if self.auto_blocked_paths.contains_key(&exe_path_lower) {
+                // Was previously auto-blocked but no longer matches — unblock
+                if let Some(original) = self.auto_blocked_paths.remove(&exe_path_lower) {
+                    if let Err(e) = self.wfp.unblock_app(&original) {
+                        log::warn!("Auto-unblock failed for {original}: {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -217,12 +284,21 @@ impl NetworkEngine {
             }
         }
 
-        // 4. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
+        // 4. Auto-block via registry — before building entries, sync WFP filters
+        //    for any process whose exe name matches the AutoBlockRegistry.
+        self.sync_auto_block_filters(&stats_map);
+
+        // 5. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
         let mut new_entries: Vec<ProcessEntry> = Vec::with_capacity(stats_map.len());
 
         for (pid, net_stats) in &stats_map {
             let exe_key = net_stats.exe_path.to_lowercase();
-            let is_blocked = self.wfp.is_blocked(&net_stats.exe_path);
+            let exe_name = get_exe_name(&net_stats.exe_path);
+
+            // Check both WFP and the AutoBlockRegistry when shield is active
+            let registry_blocked =
+                self.is_shield_active && self.rules_manager.is_target_blocked(&exe_name);
+            let is_blocked = self.wfp.is_blocked(&net_stats.exe_path) || registry_blocked;
             let connections = net_stats.tcp_connections + net_stats.udp_connections;
 
             let display_name = display_name_for(&net_stats.exe_path);
@@ -272,7 +348,7 @@ impl NetworkEngine {
             });
         }
 
-        // 5. Preserve dormant processes — only when the *specific PID* (not just exe_path)
+        // 6. Preserve dormant processes — only when the *specific PID* (not just exe_path)
         //    is no longer in the current snapshot. This prevents a new PID for the same
         //    executable from suppressing the old PID's historical entry.
         for (exe_key, acc) in &self.accumulators {
@@ -318,7 +394,7 @@ impl NetworkEngine {
             }
         }
 
-        // 6. Sort by session data descending (highest consumers first)
+        // 7. Sort by session data descending (highest consumers first)
         new_entries.sort_by(|a, b| {
             b.session_data
                 .partial_cmp(&a.session_data)
@@ -356,6 +432,14 @@ fn bytes_to_mb(bytes: u64) -> f64 {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// Extract the file name portion from a Win32 or Unix path.
+fn get_exe_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// Map executable file names to readable display names.

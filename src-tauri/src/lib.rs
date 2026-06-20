@@ -20,6 +20,7 @@ pub mod procctl;
 
 pub mod engine;
 pub mod commands;
+pub mod rules;
 
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +64,11 @@ pub fn run() {
             commands::resume_process,
             commands::kill_process,
             commands::get_suspended_pids,
+            commands::get_rules,
+            commands::toggle_rule_state,
+            commands::set_shield_active,
+            commands::add_rule,
+            commands::delete_rule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

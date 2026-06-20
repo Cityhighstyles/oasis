@@ -105,6 +105,11 @@ impl WfpEngine {
     }
 
     /// Block all outbound connections for the given Win32 executable path.
+    ///
+    /// If `FwpmFilterAdd0` returns `FWP_E_ALREADY_EXISTS` (0x80320007) — meaning
+    /// a filter from a previous session is still active in the kernel — we treat
+    /// it as success and record the path in our `blocked` map so subsequent poll
+    /// ticks don&#x27;t retry and spam the logs.
     pub fn block_app(&mut self, exe_path: &str) -> Result<(), String> {
         if self.blocked.contains_key(exe_path) {
             return Ok(());
@@ -112,18 +117,24 @@ impl WfpEngine {
         let handle = self.engine_handle()?;
         let app_id_bytes = get_app_id_bytes(exe_path)?;
 
-        let id_v4 = add_app_filter(
-            handle,
-            &app_id_bytes,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            &format!("DataGuardian BLOCK IPv4: {exe_path}"),
-        )?;
-        let id_v6 = add_app_filter(
-            handle,
-            &app_id_bytes,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            &format!("DataGuardian BLOCK IPv6: {exe_path}"),
-        )?;
+        let desc_v4 = format!("DataGuardian BLOCK IPv4: {exe_path}");
+        let desc_v6 = format!("DataGuardian BLOCK IPv6: {exe_path}");
+
+        // Helper: try to add a filter; treat FWP_E_ALREADY_EXISTS as success.
+        // We bind the descriptions outside so the &str references live long enough.
+        let try_add = |layer, desc: &str| -> Result<u64, String> {
+            match add_app_filter(handle, &app_id_bytes, layer, desc) {
+                Ok(id) => Ok(id),
+                Err(e) if e.contains("0x80320007") => {
+                    log::info!("WFP filter already exists for {exe_path} — tracking as blocked");
+                    Ok(0)
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        let id_v4 = try_add(FWPM_LAYER_ALE_AUTH_CONNECT_V4, &desc_v4)?;
+        let id_v6 = try_add(FWPM_LAYER_ALE_AUTH_CONNECT_V6, &desc_v6)?;
 
         self.blocked.insert(
             exe_path.to_string(),
