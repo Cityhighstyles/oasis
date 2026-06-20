@@ -4,15 +4,28 @@
 //! the appropriate engine method, and return a JSON-serialisable result.
 
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(target_os = "windows")]
 use crate::procctl;
 use crate::engine::{NetworkEngine, ProcessEntry};
 use crate::rules::Rule;
+use crate::sandbox::{CommandType, DetectedOperation, SandboxEngine};
+use serde::{Deserialize, Serialize};
 
-/// Managed state type registered with Tauri.
+/// Managed state type registered with Tauri (networking engine).
 pub struct AppState(pub Arc<Mutex<NetworkEngine>>);
+
+/// Managed state type for the sandbox engine.
+pub struct SandboxState(pub Arc<Mutex<SandboxEngine>>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxStatus {
+    pub is_running: bool,
+    pub has_groq_key: bool,
+    pub operations_count: usize,
+}
 
 // ──────────────────────────── commands ───────────────────────────────────────
 
@@ -228,4 +241,174 @@ pub fn delete_rule(
         .lock()
         .map_err(|e| format!("state lock poisoned: {e}"))?;
     engine.rules_manager.delete_rule(&id)
+}
+
+// ═══════════════════════════ Sandbox Commands ═══════════════════════════════
+
+/// Returns the list of detected developer operations from the sandbox scanner.
+#[tauri::command]
+pub fn get_sandbox_operations(
+    state: State<'_, SandboxState>,
+) -> Result<Vec<DetectedOperation>, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+    Ok(engine.get_operations())
+}
+
+/// Clear all detected sandbox operations.
+#[tauri::command]
+pub fn clear_sandbox_operations(
+    state: State<'_, SandboxState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+    engine.clear_operations();
+    Ok(())
+}
+
+/// Set the Groq API key for AI-powered download estimation.
+#[tauri::command]
+pub fn set_groq_api_key(
+    key: String,
+    state: State<'_, SandboxState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+    engine.set_groq_api_key(key);
+    Ok(())
+}
+
+/// Request a local size estimate for a specific operation type.
+/// Used when Groq is not configured.
+#[tauri::command]
+pub fn estimate_command_size(
+    command_type: String,
+    state: State<'_, SandboxState>,
+) -> Result<serde_json::Value, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+    // Parse command type string back to enum
+    let cmd_type = parse_command_type(&command_type);
+    let (est, rmin, rmax, conf, reasoning) = engine.local_estimate(&cmd_type);
+    Ok(serde_json::json!({
+        "estimatedMb": est,
+        "rangeMinMb": rmin,
+        "rangeMaxMb": rmax,
+        "confidence": conf,
+        "reasoning": reasoning
+    }))
+}
+
+/// Create a transparent, borderless overlay webview window for a sandbox operation.
+/// The window displays live info about the detected operation and lets the user
+/// interact with it.
+#[tauri::command]
+pub fn create_sandbox_overlay(
+    app: tauri::AppHandle,
+    operation_id: String,
+) -> Result<(), String> {
+    let label = format!("sandbox-overlay-{}", operation_id.replace('.', "-"));
+    let window = WebviewWindowBuilder::new(
+        &app,
+        &label,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Sandbox Overlay")
+    .inner_size(420.0, 340.0)
+    .min_inner_size(320.0, 260.0)
+    .transparent(true)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .center()
+    .build()
+    .map_err(|e| format!("Failed to create overlay window: {e}"))?;
+
+    // Navigate the overlay to the correct route using History API
+    // This triggers React Router's BrowserRouter to pick up the route
+    let _ = window.eval(&format!(
+        r#"window.history.pushState(null, '', '/sandbox-overlay/{}'); window.dispatchEvent(new Event('popstate'));"#,
+        operation_id
+    ));
+
+    Ok(())
+}
+
+/// Close a sandbox overlay window by operation ID.
+#[tauri::command]
+pub fn close_sandbox_overlay(
+    app: tauri::AppHandle,
+    operation_id: String,
+) -> Result<(), String> {
+    let label = format!("sandbox-overlay-{}", operation_id.replace('.', "-"));
+    if let Some(window) = app.webview_windows().get(&label).cloned() {
+        window
+            .close()
+            .map_err(|e| format!("Failed to close overlay: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Get the sandbox scanner status.
+#[tauri::command]
+pub fn get_sandbox_status(
+    state: State<'_, SandboxState>,
+) -> Result<SandboxStatus, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
+    Ok(SandboxStatus {
+        is_running: engine.is_running,
+        has_groq_key: engine.has_groq_key(),
+        operations_count: engine.detected_operations.len(),
+    })
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────
+
+fn parse_command_type(s: &str) -> CommandType {
+    match s.to_lowercase().as_str() {
+        "npminstall" | "npm install" => CommandType::NpmInstall,
+        "pnpminstall" | "pnpm install" => CommandType::PnpmInstall,
+        "yarninstall" | "yarn install" => CommandType::YarnInstall,
+        "npxrun" | "npx run" => CommandType::NpxRun,
+        "dockerpull" | "docker pull" => CommandType::DockerPull,
+        "dockerbuild" | "docker build" => CommandType::DockerBuild,
+        "dockercompose" | "docker compose" => CommandType::DockerCompose,
+        "gitclone" | "git clone" => CommandType::GitClone,
+        "gitpull" | "git pull" => CommandType::GitPull,
+        "gitfetch" | "git fetch" => CommandType::GitFetch,
+        "vscodeextinstall" | "vscode extension install" => CommandType::VscodeExtInstall,
+        "vscodeextupdate" | "vscode extension update" => CommandType::VscodeExtUpdate,
+        "pipinstall" | "pip install" => CommandType::PipInstall,
+        "pipenvinstall" | "pipenv install" => CommandType::PipenvInstall,
+        "poetryinstall" | "poetry install" => CommandType::PoetryInstall,
+        "cargoinstall" | "cargo install" => CommandType::CargoInstall,
+        "cargobuild" | "cargo build" => CommandType::CargoBuild,
+        "cargotest" | "cargo test" => CommandType::CargoTest,
+        "wingetinstall" | "winget install" => CommandType::WingetInstall,
+        "chocoinstall" | "choco install" | "chocolateyinstall" => CommandType::ChocoInstall,
+        "scoopinstall" | "scoop install" => CommandType::ScoopInstall,
+        "brewinstall" | "brew install" => CommandType::BrewInstall,
+        "aptgetinstall" | "apt-get install" => CommandType::AptGetInstall,
+        "nugetinstall" | "nuget install" => CommandType::NugetInstall,
+        "dotnetrestore" | "dotnet restore" => CommandType::DotnetRestore,
+        "dotnetbuild" | "dotnet build" => CommandType::DotnetBuild,
+        "gomoddownload" | "go mod download" => CommandType::GoModDownload,
+        "goinstall" | "go install" => CommandType::GoInstall,
+        "gobuild" | "go build" => CommandType::GoBuild,
+        "mavenbuild" | "mvn build" => CommandType::MavenBuild,
+        "gradlebuild" | "gradle build" => CommandType::GradleBuild,
+        "androidstudiodownload" | "android studio download" => CommandType::AndroidStudioDownload,
+        _ => CommandType::Other(s.to_string()),
+    }
 }

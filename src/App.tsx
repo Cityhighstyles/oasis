@@ -5,6 +5,7 @@ import { Dashboard } from "@/pages/Dashboard"
 import { RulesControls } from "@/pages/RulesControls"
 import { LiveMonitor } from "@/pages/LiveMonitor"
 import { DevSandbox } from "@/pages/DevSandbox"
+import { SandboxOverlay } from "@/pages/SandboxOverlay"
 
 export default function App() {
   return (
@@ -18,6 +19,8 @@ export default function App() {
             <Route path="/sandbox" element={<DevSandbox />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
+          {/* Sandbox overlay window (no layout — transparent, borderless) */}
+          <Route path="/sandbox-overlay/:operationId" element={<SandboxOverlay />} />
         </Routes>
       </BrowserRouter>
     </ShieldProvider>
