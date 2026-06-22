@@ -1213,8 +1213,8 @@ fn classify_shell_cmdline(lower_cmd: &str) -> Option<CommandType> {
         return Some(CommandType::YarnInstall);
     }
     // npx — only trigger for install/create/init (not generic run)
-    if (lower_cmd.contains("npx install") || lower_cmd.contains("npx create")
-        || lower_cmd.contains("npx init"))
+    if lower_cmd.contains("npx install") || lower_cmd.contains("npx create")
+        || lower_cmd.contains("npx init")
     {
         return Some(CommandType::NpxRun);
     }
@@ -1378,31 +1378,25 @@ pub fn start_scanner(
                 }
             }
 
-            // ── Estimate download sizes for new operations ──────────────
-            // Strategy: always compute local estimates first, then try to
-            // overwrite with Groq AI if the key is configured. This avoids
-            // tricky async-in-sync-thread control flow (see: the break bug).
-            if !new_ops.is_empty() {
-                std::thread::sleep(Duration::from_millis(300));
-
-                // Collect ops to estimate + groq key (brief lock, released before async)
-                let (ops_to_estimate, groq_api_key) = {
-                    if let Ok(eng) = engine.lock() {
-                        let ops = eng.detected_operations.iter()
-                            .filter(|op| op.status == "detected")
-                            .cloned()
-                            .collect();
-                        (ops, eng.groq_api_key_ref().map(|s| s.to_string()))
-                    } else {
-                        (Vec::new(), None)
-                    }
-                };
-
-                if ops_to_estimate.is_empty() {
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
+            // ── Estimate download sizes for unestimated operations ────
+            // This runs on every iteration — not just when Rust scan()
+            // returns new ops — because the Node.js detector thread adds
+            // operations directly to the engine via push_operation(),
+            // bypassing scan(). Without this, those ops would stay in
+            // "detected" status forever, showing "Estimating..." in the UI.
+            let (ops_to_estimate, groq_api_key) = {
+                if let Ok(eng) = engine.lock() {
+                    let ops = eng.detected_operations.iter()
+                        .filter(|op| op.status == "detected")
+                        .cloned()
+                        .collect();
+                    (ops, eng.groq_api_key_ref().map(|s| s.to_string()))
+                } else {
+                    (Vec::new(), None)
                 }
+            };
 
+            if !ops_to_estimate.is_empty() {
                 // ── Phase 1: local estimates for everything (baseline) ──
                 let mut estimates: Vec<(String, f64, f64, f64, f64, String)> = Vec::new();
                 for op in &ops_to_estimate {

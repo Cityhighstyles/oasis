@@ -1,9 +1,23 @@
-import { Shield, Wifi, TrendingDown, Zap, AlertTriangle, AlertCircle } from "lucide-react"
+import { useState, useEffect, useMemo } from "react"
+import {
+  Shield,
+  Wifi,
+  TrendingDown,
+  Zap,
+  AlertTriangle,
+  AlertCircle,
+  Gauge,
+  ScrollText,
+  FlaskConical,
+  Crown,
+  ArrowUpDown,
+} from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { useShield } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
+import { invoke } from "@tauri-apps/api/core"
 
 function DataBudgetRing({
   used,
@@ -66,8 +80,26 @@ function DataBudgetRing({
   )
 }
 
+/// Format bytes/sec to a human-readable string (e.g. "1.2 MB/s", "420 KB/s").
+function formatSpeed(bytesPerSecond: number): string {
+  if (bytesPerSecond >= 1024 * 1024) {
+    return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
+  } else if (bytesPerSecond >= 1024) {
+    return `${(bytesPerSecond / 1024).toFixed(0)} KB/s`
+  } else if (bytesPerSecond > 0) {
+    return `${bytesPerSecond.toFixed(0)} B/s`
+  }
+  return "0 B/s"
+}
+
+interface SandboxStatus {
+  isRunning: boolean
+  hasGroqKey: boolean
+  operationsCount: number
+}
+
 export function Dashboard() {
-  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes } =
+  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules } =
     useShield()
 
   const pct = Math.round((dataBudgetUsed / dataBudgetTotal) * 100)
@@ -77,11 +109,49 @@ export function Dashboard() {
   const activeProcesses = processes.filter((p) => p.status === "active").length
   const totalProcesses = processes.length
 
-  const recentEvents = processes.slice(0, 5).map((p) => ({
-    time: p.lastSeen === "now" ? "now" : p.lastSeen,
-    event: `${p.status === "blocked" ? "Blocked" : "Active"}: ${p.name}`,
-    type: p.status === "blocked" ? "blocked" as const : p.status === "active" ? "allowed" as const : "info" as const,
-  }))
+  // ── Sandbox status polling ──────────────────────────────────────────
+  const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const status: SandboxStatus = await invoke("get_sandbox_status")
+        if (!cancelled) setSandboxStatus(status)
+      } catch {
+        // Sandbox engine not available — ignore
+      }
+    }
+    poll()
+    const interval = setInterval(poll, 5000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [])
+
+  // ── Computed values ─────────────────────────────────────────────────
+  const totalSpeed = useMemo(() =>
+    processes.reduce((sum, p) => sum + p.speed, 0),
+    [processes]
+  )
+
+  const topConsumers = useMemo(() =>
+    [...processes]
+      .sort((a, b) => b.sessionData - a.sessionData)
+      .slice(0, 5),
+    [processes]
+  )
+
+  const activeRulesCount = useMemo(() =>
+    rules.filter((r) => r.enabled).length,
+    [rules]
+  )
+
+  const totalSessionUsage = useMemo(() =>
+    processes.reduce((sum, p) => sum + p.sessionData, 0),
+    [processes]
+  )
 
   return (
     <div className="p-6 space-y-6">
@@ -238,7 +308,7 @@ export function Dashboard() {
           <div className="col-span-2 grid grid-cols-3 gap-3">
             {[
               { icon: Zap, label: "Active Processes", value: activeProcesses.toString(), sub: "currently active", color: "text-neon-emerald" },
-              { icon: TrendingDown, label: "Session Data", value: `${dataBudgetUsed.toFixed(1)} MB`, sub: "this session", color: "text-neon-cyan" },
+              { icon: TrendingDown, label: "Session Data", value: `${totalSessionUsage.toFixed(1)} MB`, sub: "this session", color: "text-neon-cyan" },
               { icon: AlertTriangle, label: "Blocked Apps", value: blockedApps.length.toString(), sub: "rules active", color: "text-amber-400" },
             ].map(({ icon: Icon, label, value, sub, color }) => (
               <Card key={label} className="border-border bg-card">
@@ -253,51 +323,155 @@ export function Dashboard() {
               </Card>
             ))}
           </div>
+
+          {/* Quick stats row: Speed, Rules, Sandbox, Active */}
+          <div className="col-span-2 grid grid-cols-4 gap-3">
+            {/* Speed Gauge */}
+            <Card className="border-border bg-card">
+              <CardContent className="flex items-center gap-3 py-3 px-4">
+                <Gauge className={cn("size-5 shrink-0", totalSpeed > 1024 * 1024 ? "text-destructive" : totalSpeed > 0 ? "text-neon-emerald" : "text-muted-foreground/40")} />
+                <div className="min-w-0">
+                  <p className="text-[11px] text-muted-foreground truncate">Bandwidth</p>
+                  <p className={cn("text-base font-bold tabular-nums", totalSpeed > 0 ? "text-neon-emerald" : "text-muted-foreground/60")}>
+                    {formatSpeed(totalSpeed)}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60">
+                    {totalSpeed > 0 ? "active throughput" : "idle"}
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Active Rules */}
+            <Card className="border-border bg-card">
+              <CardContent className="flex items-center gap-3 py-3 px-4">
+                <ScrollText className="size-5 shrink-0 text-neon-cyan" />
+                <div className="min-w-0">
+                  <p className="text-[11px] text-muted-foreground truncate">Rules Active</p>
+                  <p className="text-base font-bold tabular-nums text-neon-cyan">
+                    {activeRulesCount}<span className="text-xs font-normal text-muted-foreground/60">/{rules.length}</span>
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60">
+                    {Math.round((activeRulesCount / Math.max(rules.length, 1)) * 100)}% engaged
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Sandbox Status */}
+            <Card className="border-border bg-card">
+              <CardContent className="flex items-center gap-3 py-3 px-4">
+                <FlaskConical className={cn("size-5 shrink-0", sandboxStatus?.isRunning ? "text-neon-emerald" : "text-muted-foreground/40")} />
+                <div className="min-w-0">
+                  <p className="text-[11px] text-muted-foreground truncate">Sandbox</p>
+                  <p className={cn("text-base font-bold tabular-nums", sandboxStatus?.isRunning ? "text-neon-emerald" : "text-muted-foreground/60")}>
+                    {sandboxStatus === null ? "—" : sandboxStatus.isRunning ? "Active" : "Off"}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60">
+                    {sandboxStatus === null ? "loading..." : sandboxStatus.isRunning ? `${sandboxStatus.operationsCount} ops detected` : "scanner stopped"}
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Active count */}
+            <Card className="border-border bg-card">
+              <CardContent className="flex items-center gap-3 py-3 px-4">
+                <ArrowUpDown className="size-5 shrink-0 text-amber-400" />
+                <div className="min-w-0">
+                  <p className="text-[11px] text-muted-foreground truncate">Connections</p>
+                  <p className="text-base font-bold tabular-nums text-amber-400">
+                    {processes.reduce((s, p) => s + p.connections, 0)}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60">
+                    across {totalProcesses} process{totalProcesses !== 1 ? "es" : ""}
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
         </div>
       </div>
 
-      {/* Recent activity log */}
+      {/* Top Bandwidth Consumers */}
       <Card className="border-border bg-card">
         <CardHeader className="pb-3 border-b border-border">
           <div className="flex items-center justify-between">
-            <CardTitle className="text-sm font-medium text-foreground">
-              Network Activity
-            </CardTitle>
+            <div className="flex items-center gap-2">
+              <Crown className="size-4 text-amber-400" />
+              <CardTitle className="text-sm font-medium text-foreground">
+                Top Bandwidth Consumers
+              </CardTitle>
+            </div>
             <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-medium">
-              {processes.length} Processes
+              {totalProcesses} process{totalProcesses !== 1 ? "es" : ""}
             </span>
           </div>
         </CardHeader>
-        <CardContent className="pt-3 p-0">
-          <div className="font-mono text-xs divide-y divide-border">
-            {recentEvents.length > 0 ? recentEvents.map((ev, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-4 px-5 py-2.5 hover:bg-accent/30 transition-colors"
-              >
-                <span className="text-muted-foreground/60 tabular-nums shrink-0">
-                  {ev.time}
-                </span>
-                <span
-                  className={cn(
-                    "shrink-0 w-14 text-[10px] uppercase tracking-wider font-semibold",
-                    ev.type === "blocked"
-                      ? "text-destructive"
-                      : ev.type === "allowed"
-                        ? "text-neon-emerald"
-                        : "text-neon-cyan"
-                  )}
+        <CardContent className="p-0">
+          {topConsumers.length > 0 ? (
+            <div className="divide-y divide-border">
+              {/* Table header */}
+              <div className="grid grid-cols-[24px_1fr_80px_100px] gap-3 px-5 py-2 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60 bg-muted/20">
+                <span>#</span>
+                <span>Process</span>
+                <span className="text-right">Speed</span>
+                <span className="text-right">Data Used</span>
+              </div>
+              {topConsumers.map((p, i) => (
+                <div
+                  key={`${p.pid}-${p.exe}`}
+                  className="grid grid-cols-[24px_1fr_80px_100px] gap-3 px-5 py-2.5 hover:bg-accent/20 transition-colors items-center"
                 >
-                  {ev.type}
-                </span>
-                <span className="text-muted-foreground truncate">{ev.event}</span>
+                  {/* Rank */}
+                  <span className={cn(
+                    "text-xs font-bold tabular-nums text-center",
+                    i === 0 ? "text-amber-400" : i === 1 ? "text-muted-foreground/80" : i === 2 ? "text-muted-foreground/60" : "text-muted-foreground/40"
+                  )}>
+                    {i + 1}
+                  </span>
+
+                  {/* Process name + exe */}
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className={cn(
+                        "size-1.5 shrink-0 rounded-full",
+                        p.status === "blocked" ? "bg-destructive" : p.status === "active" ? "bg-neon-emerald" : "bg-neon-cyan"
+                      )} />
+                      <p className="text-xs font-medium text-foreground truncate">{p.name}</p>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground/50 truncate font-mono">{p.exe}</p>
+                  </div>
+
+                  {/* Speed */}
+                  <p className={cn(
+                    "text-xs tabular-nums font-medium text-right self-center",
+                    p.speed > 0 ? "text-neon-emerald" : "text-muted-foreground/40"
+                  )}>
+                    {p.speed > 0 ? formatSpeed(p.speed) : "—"}
+                  </p>
+
+                  {/* Data used */}
+                  <p className={cn(
+                    "text-xs tabular-nums font-medium text-right self-center",
+                    p.sessionData > 0 ? "text-foreground" : "text-muted-foreground/40"
+                  )}>
+                    {p.sessionData > 0 ? `${p.sessionData.toFixed(1)} MB` : "—"}
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="flex items-center justify-center py-10 text-muted-foreground text-sm">
+              <div className="flex flex-col items-center gap-1">
+                <Crown className="size-6 text-muted-foreground/20" />
+                <p>No bandwidth data yet</p>
+                <p className="text-[10px] text-muted-foreground/50">
+                  Data usage will appear here once processes start transferring data
+                </p>
               </div>
-            )) : (
-              <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
-                No network activity detected
-              </div>
-            )}
-          </div>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>
