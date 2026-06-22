@@ -6,7 +6,6 @@ import {
   Terminal,
   Package,
   Container,
-  GitBranch,
   Puzzle,
   FileCode,
   Cog,
@@ -20,7 +19,6 @@ import {
   CheckCircle2,
   ChevronRight,
   ExternalLink,
-  Key,
   Trash2,
   Scan,
   Loader2,
@@ -33,7 +31,6 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Separator } from "@/components/ui/separator"
-import { Input } from "@/components/ui/input"
 import { useShield } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
 import { invoke } from "@tauri-apps/api/core"
@@ -79,7 +76,6 @@ interface SandboxStatus {
 const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   package: Package,
   container: Container,
-  "git-branch": GitBranch,
   puzzle: Puzzle,
   snake: FileCode,
   crab: Cog,
@@ -123,8 +119,7 @@ export function DevSandbox() {
   // ── Sandbox scanner state ───────────────────────────────────────────────
   const [operations, setOperations] = useState<DetectedOperation[]>([])
   const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null)
-  const [groqKeyInput, setGroqKeyInput] = useState("")
-  const [showGroqInput, setShowGroqInput] = useState(false)
+  // Groq API key is loaded from .env file at startup — no manual input needed
   const [isScanning, setIsScanning] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [overlayWindows, setOverlayWindows] = useState<Set<string>>(new Set())
@@ -355,19 +350,7 @@ export function DevSandbox() {
     }
   }, [])
 
-  const setGroqKey = async () => {
-    if (!groqKeyInput.trim()) return
-    try {
-      await invoke("set_groq_api_key", { key: groqKeyInput.trim() })
-      setShowGroqInput(false)
-      setGroqKeyInput("")
-      setLogLines((prev) => [...prev, "Groq AI API key configured — AI estimates enabled."])
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.error("Failed to set Groq API key:", err)
-      toast.error("Failed to set API key", { description: msg })
-    }
-  }
+
 
   const ringColor = timeLeft > 300 ? "#10b981" : timeLeft > 60 ? "#f59e0b" : "#ef4444"
 
@@ -533,62 +516,32 @@ export function DevSandbox() {
             </CardContent>
           </Card>
 
-          {/* Groq API key */}
+          {/* AI Download Estimation status */}
           <Card className="border-border bg-card">
             <CardHeader className="border-b border-border py-3 px-4">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-xs font-medium text-foreground flex items-center gap-2">
-                  <Key className="size-3.5 text-muted-foreground" />
+                <CardTitle className="text-xs font-medium text-foreground">
                   AI Download Estimation
                 </CardTitle>
-                {!showGroqInput && (
-                  <Badge
-                    variant={sandboxStatus?.hasGroqKey ? "default" : "outline"}
-                    className={cn(
-                      "text-[9px] px-2 py-0.5",
-                      sandboxStatus?.hasGroqKey
-                        ? "bg-neon-emerald/10 text-neon-emerald border-neon-emerald/20"
-                        : "text-muted-foreground border-border"
-                    )}
-                  >
-                    {sandboxStatus?.hasGroqKey ? "Groq Ready" : "Local Only"}
-                  </Badge>
-                )}
+                <Badge
+                  variant={sandboxStatus?.hasGroqKey ? "default" : "outline"}
+                  className={cn(
+                    "text-[9px] px-2 py-0.5",
+                    sandboxStatus?.hasGroqKey
+                      ? "bg-neon-emerald/10 text-neon-emerald border-neon-emerald/20"
+                      : "text-muted-foreground border-border"
+                  )}
+                >
+                  {sandboxStatus?.hasGroqKey ? "Groq AI" : "Local Only"}
+                </Badge>
               </div>
             </CardHeader>
             <CardContent className="p-3">
-              {showGroqInput ? (
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="gsk_..."
-                    value={groqKeyInput}
-                    onChange={(e) => setGroqKeyInput(e.target.value)}
-                    className="h-8 text-xs font-mono"
-                  />
-                  <Button size="sm" className="h-8 text-xs" onClick={setGroqKey}>
-                    Save
-                  </Button>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <p className="text-[10px] text-muted-foreground leading-relaxed">
-                    {sandboxStatus?.hasGroqKey
-                      ? "Groq AI is configured for intelligent download estimation."
-                      : "Using local estimation. Connect Groq for AI-powered predictions based on command analysis."}
-                  </p>
-                  {!sandboxStatus?.hasGroqKey && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 text-[10px] w-full border-dashed"
-                      onClick={() => setShowGroqInput(true)}
-                    >
-                      <Key className="size-3 mr-1" />
-                      Configure Groq API Key
-                    </Button>
-                  )}
-                </div>
-              )}
+              <p className="text-[10px] text-muted-foreground leading-relaxed">
+                {sandboxStatus?.hasGroqKey
+                  ? "Groq AI is configured via GROQ_API_KEY for intelligent download estimation."
+                  : "Using local estimation. Set GROQ_API_KEY in .env for AI-powered predictions."}
+              </p>
             </CardContent>
           </Card>
 
@@ -726,7 +679,7 @@ export function DevSandbox() {
                 <p className="text-xs text-muted-foreground/60">No operations detected yet</p>
                 <p className="text-[10px] text-muted-foreground/40 mt-1">
                   {isPaused
-                    ? "Run npm install, docker pull, git clone, or similar commands while the shield is paused"
+                    ? "Run npm install, docker pull, or similar commands while the shield is paused"
                     : "Pause the shield above to start monitoring"}
                 </p>
               </div>

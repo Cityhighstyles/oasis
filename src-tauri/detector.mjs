@@ -15,7 +15,7 @@
  *
  * Supported operations:
  *   npm install, pnpm install, yarn install, npx run,
- *   docker pull/build/compose, git clone/pull/fetch,
+ *   docker pull/build/compose,
  *   pip install, cargo install/build/test, winget/choco/scoop install,
  *   brew install, apt-get install, dotnet restore/build,
  *   go mod download/install/build, mvn/gradle build,
@@ -31,16 +31,8 @@ const POLL_MS = 500;
 // Set of "pid|cmd" strings to avoid duplicate detections.
 const seen = new Set();
 
-// Map of supported executable names (lowercase) to their command types
+// Single-purpose tools — exe name alone is sufficient to detect
 const SINGLE_PURPOSE = {
-  'npm.exe':     'npm install',
-  'npm':         'npm install',
-  'pnpm.exe':    'pnpm install',
-  'pnpm':        'pnpm install',
-  'yarn.exe':    'yarn install',
-  'yarn':        'yarn install',
-  'npx.exe':     'npx run',
-  'npx':         'npx run',
   'pip.exe':     'pip install',
   'pip':         'pip install',
   'pip3.exe':    'pip install',
@@ -72,8 +64,11 @@ const SINGLE_PURPOSE = {
 // Multi-purpose tools that need cmdline inspection
 const MULTI_PURPOSE = [
   { names: ['node.exe', 'node'], classify: classifyNode },
+  { names: ['npm.exe', 'npm'], classify: classifyNpmDirect },
+  { names: ['pnpm.exe', 'pnpm'], classify: classifyPnpmDirect },
+  { names: ['yarn.exe', 'yarn'], classify: classifyYarnDirect },
+  { names: ['npx.exe', 'npx'], classify: classifyNpxDirect },
   { names: ['docker.exe', 'docker'], classify: classifyDocker },
-  { names: ['git.exe', 'git'], classify: classifyGit },
   { names: ['code.exe', 'code'], classify: classifyVSCode },
   { names: ['cargo.exe', 'cargo'], classify: classifyCargo },
   { names: ['dotnet.exe', 'dotnet'], classify: classifyDotnet },
@@ -102,7 +97,11 @@ function classifyNode(name, cmd) {
   }
   // Check for npx
   if (lower.includes('npx')) {
-    return 'npx run';
+    // Only detect npx for install/create/init, not generic run
+    if (lower.includes('npx install') || lower.includes('npx create') || lower.includes('npx init')) {
+      return 'npx run';
+    }
+    return null;
   }
   // Check for npm
   if (lower.includes('npm')) {
@@ -114,20 +113,44 @@ function classifyNode(name, cmd) {
   return null;
 }
 
+function classifyNpmDirect(name, cmd) {
+  const lower = cmd.toLowerCase();
+  if (lower.includes('install') || lower.includes(' i ') || lower.includes(' add ') || lower.includes('ci')) {
+    return 'npm install';
+  }
+  return null;
+}
+
+function classifyPnpmDirect(name, cmd) {
+  const lower = cmd.toLowerCase();
+  if (lower.includes('install') || lower.includes(' add ') || lower.includes(' i ')) {
+    return 'pnpm install';
+  }
+  return null;
+}
+
+function classifyYarnDirect(name, cmd) {
+  const lower = cmd.toLowerCase();
+  if (lower.includes('install') || lower.includes(' add ')) {
+    return 'yarn install';
+  }
+  return null;
+}
+
+function classifyNpxDirect(name, cmd) {
+  const lower = cmd.toLowerCase();
+  if (lower.includes('install') || lower.includes(' add ') || lower.includes('create') || lower.includes('init')) {
+    return 'npx run';
+  }
+  return null;
+}
+
 function classifyDocker(name, cmd) {
   const lower = cmd.toLowerCase();
   if (lower.includes('pull') && !lower.includes('push')) return 'docker pull';
   if (lower.includes('compose build') || (lower.includes('build') && !lower.includes('compose'))) return 'docker build';
   if (lower.includes('compose') && !lower.includes('build')) return 'docker compose';
   if (lower.includes('pull')) return 'docker pull';
-  return null;
-}
-
-function classifyGit(name, cmd) {
-  const lower = cmd.toLowerCase();
-  if (lower.includes('clone')) return 'git clone';
-  if (lower.includes('pull')) return 'git pull';
-  if (lower.includes('fetch')) return 'git fetch';
   return null;
 }
 

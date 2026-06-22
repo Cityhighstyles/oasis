@@ -270,20 +270,6 @@ pub fn clear_sandbox_operations(
     Ok(())
 }
 
-/// Set the Groq API key for AI-powered download estimation.
-#[tauri::command]
-pub fn set_groq_api_key(
-    key: String,
-    state: State<'_, SandboxState>,
-) -> Result<(), String> {
-    let mut engine = state
-        .0
-        .lock()
-        .map_err(|e| format!("sandbox state lock poisoned: {e}"))?;
-    engine.set_groq_api_key(key);
-    Ok(())
-}
-
 /// Request a local size estimate for a specific operation type.
 /// Used when Groq is not configured.
 #[tauri::command]
@@ -332,10 +318,12 @@ pub fn create_sandbox_overlay(
     .build()
     .map_err(|e| format!("Failed to create overlay window: {e}"))?;
 
-    // Navigate the overlay to the correct route using History API
-    // This triggers React Router's BrowserRouter to pick up the route
+    // Set the operation ID on the window so the SandboxOverlay component
+    // can read it via its __SANDBOX_OP_ID__ fallback mechanism. The overlay
+    // window stays at index.html — no URL navigation needed, avoiding SPA
+    // asset resolution issues in production builds.
     let _ = window.eval(&format!(
-        r#"window.history.pushState(null, '', '/sandbox-overlay/{}'); window.dispatchEvent(new Event('popstate'));"#,
+        r#"window.__SANDBOX_OP_ID__ = '{}';"#,
         operation_id
     ));
 

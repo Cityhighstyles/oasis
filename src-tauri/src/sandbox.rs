@@ -34,10 +34,6 @@ pub enum CommandType {
     DockerPull,
     DockerBuild,
     DockerCompose,
-    // ── Version control ────────────────────────────────────────────
-    GitClone,
-    GitPull,
-    GitFetch,
     // ── VS Code ───────────────────────────────────────────────────
     VscodeExtInstall,
     VscodeExtUpdate,
@@ -83,9 +79,7 @@ impl CommandType {
             CommandType::DockerPull => "docker pull",
             CommandType::DockerBuild => "docker build",
             CommandType::DockerCompose => "docker compose",
-            CommandType::GitClone => "git clone",
-            CommandType::GitPull => "git pull",
-            CommandType::GitFetch => "git fetch",
+
             CommandType::VscodeExtInstall => "VS Code Extension Install",
             CommandType::VscodeExtUpdate => "VS Code Extension Update",
             CommandType::PipInstall => "pip install",
@@ -119,8 +113,7 @@ impl CommandType {
                 | CommandType::YarnInstall | CommandType::NpxRun => "package",
             CommandType::DockerPull | CommandType::DockerBuild
                 | CommandType::DockerCompose => "container",
-            CommandType::GitClone | CommandType::GitPull
-                | CommandType::GitFetch => "git-branch",
+
             CommandType::VscodeExtInstall | CommandType::VscodeExtUpdate => "puzzle",
             CommandType::PipInstall | CommandType::PipenvInstall
                 | CommandType::PoetryInstall => "snake",
@@ -150,9 +143,7 @@ impl CommandType {
             "docker pull" => CommandType::DockerPull,
             "docker build" => CommandType::DockerBuild,
             "docker compose" => CommandType::DockerCompose,
-            "git clone" => CommandType::GitClone,
-            "git pull" => CommandType::GitPull,
-            "git fetch" => CommandType::GitFetch,
+
             "vscode extension install" => CommandType::VscodeExtInstall,
             "vscode extension update" => CommandType::VscodeExtUpdate,
             "pip install" => CommandType::PipInstall,
@@ -622,13 +613,7 @@ impl SandboxEngine {
                 "Docker builds pull base layers and add build artifacts".into()),
             CommandType::DockerCompose => (200.0, 10.0, 1500.0, 0.3,
                 "docker compose pulls all services defined in compose file".into()),
-            // ── Git ───────────────────────────────────────────────────────
-            CommandType::GitClone => (50.0, 0.1, 500.0, 0.5,
-                "Git clones: small repos ~100KB, monorepos ~500MB".into()),
-            CommandType::GitPull => (5.0, 0.01, 100.0, 0.6,
-                "git pull: downloads only new commits and objects".into()),
-            CommandType::GitFetch => (3.0, 0.01, 80.0, 0.6,
-                "git fetch: downloads new refs and objects without merging".into()),
+    
             // ── VS Code ───────────────────────────────────────────────────
             CommandType::VscodeExtInstall => (5.0, 0.5, 50.0, 0.6,
                 "VS Code extensions average 2-10MB, some with language servers up to 50MB".into()),
@@ -951,7 +936,6 @@ fn is_supported_exe(exe_name: &str) -> bool {
             | "yarn.exe" | "yarn"
             | "npx.exe" | "npx"
             | "docker.exe" | "docker"
-            | "git.exe" | "git"
             | "code.exe" | "code"
             | "pip.exe" | "pip" | "pip3.exe" | "pip3"
             | "pipenv.exe" | "pipenv"
@@ -992,7 +976,7 @@ fn is_supported_shell(exe_name: &str) -> bool {
 /// Classification strategy (by priority):
 ///   1. Exe-name-only match — for single-purpose package managers (npm.exe,
 ///      pip.exe, winget.exe, etc.), the executable name alone is sufficient.
-///   2. Cmdline-enriched match — for multi-purpose tools (cargo, git, docker),
+///   2. Cmdline-enriched match — for multi-purpose tools (cargo, docker, etc.),
 ///      use the command line for finer-grained sub-type classification.
 ///   3. Shell-proxy match — for cmd.exe / powershell.exe, parse embedded
 ///      commands from the shell's command line (e.g. "cmd /c npm install").
@@ -1012,12 +996,6 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
 
     let exe_only = || -> Option<CommandType> {
         match lower_exe.as_str() {
-            // ── JavaScript / Node.js ────────────────────────────────
-            "npm.exe" | "npm" => Some(CommandType::NpmInstall),
-            "pnpm.exe" | "pnpm" => Some(CommandType::PnpmInstall),
-            "yarn.exe" | "yarn" => Some(CommandType::YarnInstall),
-            "npx.exe" | "npx" => Some(CommandType::NpxRun),
-
             // ── Python ────────────────────────────────────────────
             "pip.exe" | "pip" | "pip3.exe" | "pip3" => Some(CommandType::PipInstall),
             "pipenv.exe" | "pipenv" => Some(CommandType::PipenvInstall),
@@ -1094,6 +1072,44 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
         // ── Node.js — requires cmdline to determine the tool ─────────
         "node.exe" | "node" => pm_from_node(),
 
+        // ── npm / pnpm / yarn / npx (direct invocations) — only on install keywords ──
+        "npm.exe" | "npm" => {
+            if cmdline.is_empty() {
+                None
+            } else if has_arg("install") || has_arg(" i ") || has_arg(" add ") || has_arg("ci") {
+                Some(CommandType::NpmInstall)
+            } else {
+                None
+            }
+        }
+        "pnpm.exe" | "pnpm" => {
+            if cmdline.is_empty() {
+                None
+            } else if has_arg("install") || has_arg(" add ") || has_arg(" i ") {
+                Some(CommandType::PnpmInstall)
+            } else {
+                None
+            }
+        }
+        "yarn.exe" | "yarn" => {
+            if cmdline.is_empty() {
+                None
+            } else if has_arg("install") || has_arg(" add ") {
+                Some(CommandType::YarnInstall)
+            } else {
+                None
+            }
+        }
+        "npx.exe" | "npx" => {
+            if cmdline.is_empty() {
+                None
+            } else if has_arg("install") || has_arg(" add ") || has_arg("create") || has_arg("init") {
+                Some(CommandType::NpxRun)
+            } else {
+                None
+            }
+        }
+
         // ── Docker — multi-purpose: pull / build / compose ──────────
         "docker.exe" | "docker" => {
             if cmdline.is_empty() {
@@ -1107,22 +1123,6 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
                 Some(CommandType::DockerCompose)
             } else if has_arg("pull") {
                 Some(CommandType::DockerPull)
-            } else {
-                None
-            }
-        }
-
-        // ── Git — multi-purpose: clone / pull / fetch ──────────────
-        "git.exe" | "git" => {
-            if cmdline.is_empty() {
-                // Default to GitClone when cmdline unavailable
-                Some(CommandType::GitClone)
-            } else if has_arg("clone") {
-                Some(CommandType::GitClone)
-            } else if has_arg("pull") {
-                Some(CommandType::GitPull)
-            } else if has_arg("fetch") {
-                Some(CommandType::GitFetch)
             } else {
                 None
             }
@@ -1197,7 +1197,7 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
 /// To avoid false positives from idle terminal windows, we require BOTH the tool
 /// name AND a relevant keyword (e.g., "npm" AND "install") to be present.
 fn classify_shell_cmdline(lower_cmd: &str) -> Option<CommandType> {
-    // npm / pnpm / yarn / npx
+    // npm / pnpm / yarn / npx — only on install/download keywords
     if lower_cmd.contains("npm install") || lower_cmd.contains("npm i ")
         || lower_cmd.contains("npm add ") || lower_cmd.contains("npm ci")
     {
@@ -1212,7 +1212,9 @@ fn classify_shell_cmdline(lower_cmd: &str) -> Option<CommandType> {
     {
         return Some(CommandType::YarnInstall);
     }
-    if lower_cmd.contains("npx ")
+    // npx — only trigger for install/create/init (not generic run)
+    if (lower_cmd.contains("npx install") || lower_cmd.contains("npx create")
+        || lower_cmd.contains("npx init"))
     {
         return Some(CommandType::NpxRun);
     }
@@ -1229,16 +1231,6 @@ fn classify_shell_cmdline(lower_cmd: &str) -> Option<CommandType> {
     }
     if lower_cmd.contains("docker compose") && !lower_cmd.contains("docker compose build") {
         return Some(CommandType::DockerCompose);
-    }
-    // git
-    if lower_cmd.contains("git clone") {
-        return Some(CommandType::GitClone);
-    }
-    if lower_cmd.contains("git pull") {
-        return Some(CommandType::GitPull);
-    }
-    if lower_cmd.contains("git fetch") {
-        return Some(CommandType::GitFetch);
     }
     // cargo
     if lower_cmd.contains("cargo install") {
@@ -1318,23 +1310,6 @@ fn extract_package_name(cmd_type: &CommandType, cmdline: &str) -> String {
                 .unwrap_or("");
             if !first_word.is_empty() {
                 return first_word.to_string();
-            }
-        }
-    }
-
-    // For clone commands, extract the repo URL/name
-    if matches!(cmd_type, CommandType::GitClone) {
-        if let Some(pos) = lower.find("clone") {
-            let after = &cmdline[pos + 5..].trim();
-            let url = after.split_whitespace().next().unwrap_or("");
-            // Extract the repo name from the URL
-            let repo_name = url.rsplit('/').next().unwrap_or(url);
-            let repo_name = repo_name.trim_end_matches(".git");
-            if !repo_name.is_empty() && repo_name != url {
-                return repo_name.to_string();
-            }
-            if !url.is_empty() && !url.starts_with('-') {
-                return url.to_string();
             }
         }
     }

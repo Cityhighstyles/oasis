@@ -32,6 +32,10 @@ use sandbox::SandboxEngine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Load environment variables from .env file (if present) ─────────────
+    // This makes GROQ_API_KEY available to SandboxEngine::new() below.
+    dotenvy::dotenv().ok();
+
     // ── Build the shared engine ──────────────────────────────────────────────
     let engine = Arc::new(Mutex::new(NetworkEngine::new()));
 
@@ -84,7 +88,6 @@ pub fn run() {
             // ── Sandbox commands ───────────────────────────────────────────
             commands::get_sandbox_operations,
             commands::clear_sandbox_operations,
-            commands::set_groq_api_key,
             commands::estimate_command_size,
             commands::create_sandbox_overlay,
             commands::close_sandbox_overlay,
