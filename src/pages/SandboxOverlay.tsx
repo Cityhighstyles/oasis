@@ -39,6 +39,17 @@ export function SandboxOverlay() {
       const win = window as any
       if (win.__SANDBOX_OP_ID__) {
         setOperationId(win.__SANDBOX_OP_ID__)
+      } else {
+        // Fallback: extract from window label if possible
+        try {
+          const label = getCurrentWebviewWindow().label
+          if (label.startsWith("sandbox-overlay-")) {
+            const idFromLabel = label.replace("sandbox-overlay-", "").replace(/-/g, ".")
+            setOperationId(idFromLabel)
+          }
+        } catch {
+          // Ignore
+        }
       }
     }
   }, [paramId])

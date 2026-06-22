@@ -16,13 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use chrono::Local;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use tauri::Emitter;
 use log;
 
 // ── Supported command types ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum CommandType {
     // ── JavaScript / Node.js ────────────────────────────────────────
@@ -66,6 +66,19 @@ pub enum CommandType {
     AndroidStudioDownload,
     // ── Catch-all ──────────────────────────────────────────────────
     Other(String),
+}
+
+impl Serialize for CommandType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("CommandType", 2)?;
+        state.serialize_field("label", self.label())?;
+        state.serialize_field("icon", self.icon())?;
+        state.end()
+    }
 }
 
 impl CommandType {
