@@ -139,19 +139,38 @@ export function DevSandbox() {
   const minutes = Math.floor(timeLeft / 60)
   const seconds = timeLeft % 60
 
-  // ── Listen for sandbox events ───────────────────────────────────────────
-  useEffect(() => {
-    const unlisteners: Promise<UnlistenFn>[] = []
+  // ── Listen for sandbox events (with proper cleanup) ────────────────────
+  // IMPORTANT: The cleanup MUST complete before remount, otherwise duplicate
+  // listeners accumulate and cause "two children with the same key" errors.
+  // We use a ref + sync initialization pattern to avoid the async race.
+  const unlistenRef = useRef<UnlistenFn[]>([])
 
+  useEffect(() => {
     const setup = async () => {
+      // Unregister any stale listeners first (defensive — effect cleanup
+      // should have already done this, but Strict Mode double-mount can
+      // cause races if the async setup outlives the cleanup)
+      for (const fn of unlistenRef.current) {
+        fn()
+      }
+      unlistenRef.current = []
+
       const u1 = await listen<DetectedOperation>("sandbox-operation-detected", (event) => {
-        setOperations((prev) => [event.payload, ...prev])
+        setOperations((prev) => {
+          // Dedup by ID: if this operation is already in the list, skip it.
+          // This handles race conditions where both the event and the polling
+          // produce the same operation simultaneously.
+          if (prev.some((op) => op.id === event.payload.id)) {
+            return prev
+          }
+          return [event.payload, ...prev]
+        })
         setLogLines((prev) => [
           ...prev,
           `[${event.payload.detectedAt}] Detected: ${event.payload.commandType.label} (PID ${event.payload.pid})`,
         ])
       })
-      unlisteners.push(Promise.resolve(u1))
+      unlistenRef.current.push(u1)
 
       const u2 = await listen<DetectedOperation>("sandbox-operation-updated", (event) => {
         setOperations((prev) =>
@@ -164,12 +183,17 @@ export function DevSandbox() {
           ])
         }
       })
-      unlisteners.push(Promise.resolve(u2))
+      unlistenRef.current.push(u2)
     }
     setup()
 
     return () => {
-      unlisteners.forEach((p) => p.then((fn) => fn()))
+      // Synchronously unregister all listeners. The ref ensures we always
+      // have the latest list even if setup() hasn't resolved yet.
+      for (const fn of unlistenRef.current) {
+        fn()
+      }
+      unlistenRef.current = []
     }
   }, [])
 

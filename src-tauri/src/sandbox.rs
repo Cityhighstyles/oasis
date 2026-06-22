@@ -10,6 +10,8 @@
 //!    any available metadata (e.g. package.json contents).
 
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -263,6 +265,8 @@ pub struct SandboxEngine {
     scanner_stop_signal: Option<Arc<AtomicBool>>,
     /// Set of (pid, cmdline_hash) for operations already detected (dedup).
     seen_operations: HashSet<(u32, u64)>,
+    /// PID of the Node.js systeminformation detector child process (used to kill it on shutdown).
+    detector_pid: Option<u32>,
 }
 
 impl SandboxEngine {
@@ -276,6 +280,7 @@ impl SandboxEngine {
             id_counter: 0,
             scanner_stop_signal: None,
             seen_operations: HashSet::new(),
+            detector_pid: None,
         }
     }
 
@@ -305,6 +310,32 @@ impl SandboxEngine {
     }
 
     /// Return cloned list of detected operations (newest first).
+    /// Check if a process+cmdline combo has already been seen (dedup).
+    pub fn is_seen(&self, pid: u32, cmdline: &str) -> bool {
+        self.seen_operations.contains(&(pid, fxhash(cmdline)))
+    }
+
+    /// Mark a process+cmdline as seen.
+    pub fn mark_seen(&mut self, pid: u32, cmdline: &str) {
+        self.seen_operations.insert((pid, fxhash(cmdline)));
+    }
+
+    /// Generate a new unique operation ID.
+    pub fn next_id(&mut self) -> String {
+        self.id_counter += 1;
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        format!("op-{}-{}", epoch_ms, self.id_counter)
+    }
+
+    /// Add a fully-formed operation to the engine and return it.
+    pub fn push_operation(&mut self, op: DetectedOperation) -> DetectedOperation {
+        self.detected_operations.push(op.clone());
+        op
+    }
+
     pub fn get_operations(&self) -> Vec<DetectedOperation> {
         let mut ops = self.detected_operations.clone();
         ops.reverse();
@@ -335,6 +366,11 @@ impl SandboxEngine {
                 if is_supported_exe(exe_name) {
                     pids_needing_cmdline.push(*pid);
                 }
+                // Also check shell processes (cmd.exe, powershell.exe) which may
+                // run developer commands via batch files or shell invocations.
+                if is_supported_shell(exe_name) {
+                    pids_needing_cmdline.push(*pid);
+                }
             }
             // Always update known PIDs
             self.known_pids.insert(*pid, exe_name.clone());
@@ -347,14 +383,14 @@ impl SandboxEngine {
         };
 
         // Now classify each new process with its command line
-        for (pid, exe_name, _exe_path) in &current_processes {
+        for (pid, exe_name, exe_path) in &current_processes {
             // Only process newly seen PIDs that are supported
             if !pids_needing_cmdline.contains(pid) {
                 continue;
             }
 
             let cmdline = cmdlines.get(pid).cloned().unwrap_or_default();
-            if let Some(cmd_type) = classify_process_cmdline(exe_name, &cmdline) {
+            if let Some(cmd_type) = classify_process_cmdline(exe_name, exe_path, &cmdline) {
                 // Build a dedup key: (pid, hash of cmdline)
                 let cmd_hash = fxhash(&cmdline);
                 let dedup_key = (*pid, cmd_hash);
@@ -367,10 +403,10 @@ impl SandboxEngine {
                 let package_name = extract_package_name(&cmd_type, &cmdline);
                 let working_dir = workdirs.get(pid).cloned().unwrap_or_default();
 
-                self.id_counter += 1;
                 let now = Local::now().format("%H:%M:%S%.3f").to_string();
+                let op_id = self.next_id();
                 let op = DetectedOperation {
-                    id: format!("op-{}", self.id_counter),
+                    id: op_id,
                     command_type: cmd_type.clone(),
                     command_line: cmdline,
                     executable: exe_name.clone(),
@@ -904,7 +940,7 @@ fn read_process_cmdline_and_cwd(_handle: *mut std::ffi::c_void) -> Option<(Strin
 // ── Process classification ────────────────────────────────────────────────
 
 /// Quick check: is this executable name one we care about?
-/// Used to avoid expensive PowerShell calls for irrelevant processes.
+/// Used to avoid expensive system calls for irrelevant processes.
 fn is_supported_exe(exe_name: &str) -> bool {
     let lower = exe_name.to_lowercase();
     matches!(
@@ -936,18 +972,102 @@ fn is_supported_exe(exe_name: &str) -> bool {
     )
 }
 
-/// Given an executable name AND its command line, classify the exact
-/// developer operation (distinguishes "npm install" from "npm run build").
-fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType> {
+/// Check if the executable is a shell (cmd.exe, powershell.exe) that may
+/// run developer commands indirectly via batch files or -Command flags.
+/// Shells are detected separately so they can be scanned for embedded
+/// developer commands in their command line without causing false positives
+/// for idle terminal windows.
+fn is_supported_shell(exe_name: &str) -> bool {
+    let lower = exe_name.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "cmd.exe" | "cmd"
+            | "powershell.exe" | "powershell" | "pwsh.exe" | "pwsh"
+    )
+}
+
+/// Given an executable name, its full path, and its command line, classify the
+/// exact developer operation (distinguishes "npm install" from "npm run build").
+///
+/// Classification strategy (by priority):
+///   1. Exe-name-only match — for single-purpose package managers (npm.exe,
+///      pip.exe, winget.exe, etc.), the executable name alone is sufficient.
+///   2. Cmdline-enriched match — for multi-purpose tools (cargo, git, docker),
+///      use the command line for finer-grained sub-type classification.
+///   3. Shell-proxy match — for cmd.exe / powershell.exe, parse embedded
+///      commands from the shell's command line (e.g. "cmd /c npm install").
+///
+fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> Option<CommandType> {
     let lower_exe = exe_name.to_lowercase();
     let lower_cmd = cmdline.to_lowercase();
 
-    // Helper: check if the command line contains a keyword after the exe name
+    // Helper: check if the command line contains a keyword
     let has_arg = |keyword: &str| lower_cmd.contains(keyword);
 
+    // ────────────────────────────────────────────────────────────────────
+    // Phase 1: Exe-name-only match — for single-purpose package managers.
+    // These tools have no purpose other than installing/updating packages,
+    // so any invocation should be detected regardless of cmdline content.
+    // ────────────────────────────────────────────────────────────────────
+
+    let exe_only = || -> Option<CommandType> {
+        match lower_exe.as_str() {
+            // ── JavaScript / Node.js ────────────────────────────────
+            "npm.exe" | "npm" => Some(CommandType::NpmInstall),
+            "pnpm.exe" | "pnpm" => Some(CommandType::PnpmInstall),
+            "yarn.exe" | "yarn" => Some(CommandType::YarnInstall),
+            "npx.exe" | "npx" => Some(CommandType::NpxRun),
+
+            // ── Python ────────────────────────────────────────────
+            "pip.exe" | "pip" | "pip3.exe" | "pip3" => Some(CommandType::PipInstall),
+            "pipenv.exe" | "pipenv" => Some(CommandType::PipenvInstall),
+            "poetry.exe" | "poetry" => Some(CommandType::PoetryInstall),
+
+            // ── Windows package managers ────────────────────────────
+            "winget.exe" | "winget" => Some(CommandType::WingetInstall),
+            "choco.exe" | "chocolatey.exe" => Some(CommandType::ChocoInstall),
+            "scoop.exe" | "scoop" => Some(CommandType::ScoopInstall),
+
+            // ── Linux / cross-platform ──────────────────────────────
+            "brew.exe" | "brew" => Some(CommandType::BrewInstall),
+            "apt.exe" | "apt-get.exe" => Some(CommandType::AptGetInstall),
+
+            // ── .NET ────────────────────────────────────────────────
+            "nuget.exe" | "nuget" => Some(CommandType::NugetInstall),
+
+            // ── Java / JVM ──────────────────────────────────────────
+            "mvn.exe" | "mvn" | "mvnw.bat" | "mvnw" => Some(CommandType::MavenBuild),
+            "gradle.exe" | "gradle" | "gradlew.bat" | "gradlew" => Some(CommandType::GradleBuild),
+            "studio64.exe" | "studio64" | "androidstudio.exe" | "androidstudio" => Some(CommandType::AndroidStudioDownload),
+
+            // ── Rust (unambiguous via exe name) ─────────────────────
+            "rustc.exe" | "rustc" => Some(CommandType::CargoBuild),
+
+            _ => None, // Not a single-purpose tool — fall through to Phase 2
+        }
+    };
+
+    if let Some(cmd_type) = exe_only() {
+        return Some(cmd_type);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Phase 2: Cmdline-enriched match — for multi-purpose tools that need
+    // the command line to distinguish sub-operations (install vs build vs
+    // clone vs pull). When cmdline is empty (PEB read failure), fall back
+    // to a reasonable default for each tool.
+    // ────────────────────────────────────────────────────────────────────
+
     // Helper: detect which package manager wraps around node.exe
-    // Returns None when the command line doesn't clearly match an operation.
-    let pm_from_node_cmdline = || -> Option<CommandType> {
+    let pm_from_node = || -> Option<CommandType> {
+        if cmdline.is_empty() {
+            // PEB read failed — try to infer from exe path.
+            // node.exe itself doesn't contain npm in its path, but the
+            // command line (which we can't read) would. As last resort,
+            // return None for node.exe (too many false positives).
+            return None;
+        }
+        // Cmdline available — check for known node-based tools
         if has_arg("pnpm") {
             if has_arg("install") || has_arg("add ") || has_arg("i ") { Some(CommandType::PnpmInstall) }
             else { None }
@@ -957,100 +1077,226 @@ fn classify_process_cmdline(exe_name: &str, cmdline: &str) -> Option<CommandType
         } else if has_arg("npx") {
             Some(CommandType::NpxRun)
         } else if has_arg("npm") {
-            if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci") { Some(CommandType::NpmInstall) }
-            else { None }
+            // npm can appear as "npm-cli.js", "npm.js", or "npm install"
+            if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci") || has_arg("-cli")
+            {
+                Some(CommandType::NpmInstall)
+            } else {
+                // Has "npm" in cmdline but no install keyword — likely "npm run" or "npm exec"
+                None
+            }
         } else {
             None
         }
     };
 
     match lower_exe.as_str() {
-        // ── Node.js / npm / pnpm / yarn / npx ─────────────────────
-        "node.exe" | "node" => pm_from_node_cmdline(),
-        "npm.exe" | "npm" => {
-            if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci") {
-                Some(CommandType::NpmInstall)
+        // ── Node.js — requires cmdline to determine the tool ─────────
+        "node.exe" | "node" => pm_from_node(),
+
+        // ── Docker — multi-purpose: pull / build / compose ──────────
+        "docker.exe" | "docker" => {
+            if cmdline.is_empty() {
+                // Default to DockerPull when cmdline unavailable
+                Some(CommandType::DockerPull)
+            } else if has_arg("pull") && !has_arg("push") {
+                Some(CommandType::DockerPull)
+            } else if has_arg("build") || has_arg("compose build") {
+                Some(CommandType::DockerBuild)
+            } else if has_arg("compose") && !has_arg("build") {
+                Some(CommandType::DockerCompose)
+            } else if has_arg("pull") {
+                Some(CommandType::DockerPull)
             } else {
                 None
             }
         }
-        "pnpm.exe" | "pnpm" => Some(CommandType::PnpmInstall),
-        "yarn.exe" | "yarn" => Some(CommandType::YarnInstall),
-        "npx.exe" | "npx" => Some(CommandType::NpxRun),
 
-        // ── Docker ───────────────────────────────────────────────
-        "docker.exe" | "docker" => {
-            if has_arg("pull") && !has_arg("push") { Some(CommandType::DockerPull) }
-            else if has_arg("build") || has_arg("compose build") { Some(CommandType::DockerBuild) }
-            else if has_arg("compose") && !has_arg("build") { Some(CommandType::DockerCompose) }
-            else if has_arg("pull") { Some(CommandType::DockerPull) }
-            else { None }
-        }
-
-        // ── Git ──────────────────────────────────────────────────
+        // ── Git — multi-purpose: clone / pull / fetch ──────────────
         "git.exe" | "git" => {
-            if has_arg("clone") { Some(CommandType::GitClone) }
-            else if has_arg("pull") { Some(CommandType::GitPull) }
-            else if has_arg("fetch") { Some(CommandType::GitFetch) }
-            else { None }
+            if cmdline.is_empty() {
+                // Default to GitClone when cmdline unavailable
+                Some(CommandType::GitClone)
+            } else if has_arg("clone") {
+                Some(CommandType::GitClone)
+            } else if has_arg("pull") {
+                Some(CommandType::GitPull)
+            } else if has_arg("fetch") {
+                Some(CommandType::GitFetch)
+            } else {
+                None
+            }
         }
 
-        // ── VS Code ──────────────────────────────────────────────
+        // ── VS Code — multi-purpose: install / update extensions ────
         "code.exe" | "code" => {
-            if has_arg("--install-extension") { Some(CommandType::VscodeExtInstall) }
-            else if has_arg("--update-extensions") || has_arg("--list-extensions") { Some(CommandType::VscodeExtUpdate) }
-            else { None }
+            if has_arg("--install-extension") {
+                Some(CommandType::VscodeExtInstall)
+            } else if has_arg("--update-extensions") || has_arg("--list-extensions") {
+                Some(CommandType::VscodeExtUpdate)
+            } else {
+                None
+            }
         }
 
-        // ── Python / pip ─────────────────────────────────────────
-        "pip.exe" | "pip" | "pip3.exe" | "pip3" => {
-            if has_arg("install") { Some(CommandType::PipInstall) }
-            else { None }
-        }
-        "pipenv.exe" | "pipenv" => Some(CommandType::PipenvInstall),
-        "poetry.exe" | "poetry" => Some(CommandType::PoetryInstall),
-
-        // ── Rust ─────────────────────────────────────────────────
+        // ── Rust Cargo — multi-purpose: install / build / test ──────
         "cargo.exe" | "cargo" => {
-            if has_arg("install") { Some(CommandType::CargoInstall) }
-            else if has_arg("build") || has_arg("b ") { Some(CommandType::CargoBuild) }
-            else if has_arg("test") || has_arg("t ") { Some(CommandType::CargoTest) }
-            else { None }
+            if cmdline.is_empty() {
+                // Default to CargoBuild (most common download-heavy op)
+                Some(CommandType::CargoBuild)
+            } else if has_arg("install") {
+                Some(CommandType::CargoInstall)
+            } else if has_arg("build") || has_arg("b ") {
+                Some(CommandType::CargoBuild)
+            } else if has_arg("test") || has_arg("t ") {
+                Some(CommandType::CargoTest)
+            } else {
+                None
+            }
         }
-        "rustc.exe" | "rustc" => Some(CommandType::CargoBuild),
 
-        // ── Windows package managers ─────────────────────────────
-        "winget.exe" | "winget" => Some(CommandType::WingetInstall),
-        "choco.exe" | "chocolatey.exe" => Some(CommandType::ChocoInstall),
-        "scoop.exe" | "scoop" => Some(CommandType::ScoopInstall),
-
-        // ── Linux / cross-platform ───────────────────────────────
-        "brew.exe" | "brew" => Some(CommandType::BrewInstall),
-        "apt.exe" | "apt-get.exe" => Some(CommandType::AptGetInstall),
-
-        // ── .NET ─────────────────────────────────────────────────
-        "nuget.exe" | "nuget" => Some(CommandType::NugetInstall),
+        // ── .NET — multi-purpose: restore / build ───────────────────
         "dotnet.exe" | "dotnet" => {
-            if has_arg("restore") { Some(CommandType::DotnetRestore) }
-            else if has_arg("build") { Some(CommandType::DotnetBuild) }
-            else { None }
+            if cmdline.is_empty() {
+                // Default to DotnetRestore when cmdline unavailable
+                Some(CommandType::DotnetRestore)
+            } else if has_arg("restore") {
+                Some(CommandType::DotnetRestore)
+            } else if has_arg("build") {
+                Some(CommandType::DotnetBuild)
+            } else {
+                None
+            }
         }
 
-        // ── Go ───────────────────────────────────────────────────
+        // ── Go — multi-purpose: mod / install / build ───────────────
         "go.exe" | "go" => {
-            if has_arg("mod download") || has_arg("mod tidy") { Some(CommandType::GoModDownload) }
-            else if has_arg("install") { Some(CommandType::GoInstall) }
-            else if has_arg("build") || has_arg("run") { Some(CommandType::GoBuild) }
-            else { None }
+            if cmdline.is_empty() {
+                // Default to GoInstall when cmdline unavailable
+                Some(CommandType::GoInstall)
+            } else if has_arg("mod download") || has_arg("mod tidy") {
+                Some(CommandType::GoModDownload)
+            } else if has_arg("install") {
+                Some(CommandType::GoInstall)
+            } else if has_arg("build") || has_arg("run") {
+                Some(CommandType::GoBuild)
+            } else {
+                None
+            }
         }
 
-        // ── Java / JVM ───────────────────────────────────────────
-        "mvn.exe" | "mvn" | "mvnw.bat" | "mvnw" => Some(CommandType::MavenBuild),
-        "gradle.exe" | "gradle" | "gradlew.bat" | "gradlew" => Some(CommandType::GradleBuild),
-        "studio64.exe" | "studio64" | "androidstudio.exe" | "androidstudio" => Some(CommandType::AndroidStudioDownload),
-
-        _ => None,
+        // ── Catch-all (e.g., shells like cmd.exe / powershell.exe) ──
+        _ => classify_shell_cmdline(&lower_cmd),
     }
+}
+
+/// Classify embedded developer commands from shell processes (cmd.exe, powershell.exe).
+/// These shells run batch files like `npm.cmd` or use `-Command` flags to invoke
+/// developer tools. We parse the shell's command line for known tool patterns.
+///
+/// To avoid false positives from idle terminal windows, we require BOTH the tool
+/// name AND a relevant keyword (e.g., "npm" AND "install") to be present.
+fn classify_shell_cmdline(lower_cmd: &str) -> Option<CommandType> {
+    // npm / pnpm / yarn / npx
+    if lower_cmd.contains("npm install") || lower_cmd.contains("npm i ")
+        || lower_cmd.contains("npm add ") || lower_cmd.contains("npm ci")
+    {
+        return Some(CommandType::NpmInstall);
+    }
+    if lower_cmd.contains("pnpm install") || lower_cmd.contains("pnpm add ")
+        || lower_cmd.contains("pnpm i ")
+    {
+        return Some(CommandType::PnpmInstall);
+    }
+    if lower_cmd.contains("yarn install") || lower_cmd.contains("yarn add ")
+    {
+        return Some(CommandType::YarnInstall);
+    }
+    if lower_cmd.contains("npx ")
+    {
+        return Some(CommandType::NpxRun);
+    }
+    // pip
+    if lower_cmd.contains("pip install") {
+        return Some(CommandType::PipInstall);
+    }
+    // docker
+    if lower_cmd.contains("docker pull") {
+        return Some(CommandType::DockerPull);
+    }
+    if lower_cmd.contains("docker build") || lower_cmd.contains("docker compose build") {
+        return Some(CommandType::DockerBuild);
+    }
+    if lower_cmd.contains("docker compose") && !lower_cmd.contains("docker compose build") {
+        return Some(CommandType::DockerCompose);
+    }
+    // git
+    if lower_cmd.contains("git clone") {
+        return Some(CommandType::GitClone);
+    }
+    if lower_cmd.contains("git pull") {
+        return Some(CommandType::GitPull);
+    }
+    if lower_cmd.contains("git fetch") {
+        return Some(CommandType::GitFetch);
+    }
+    // cargo
+    if lower_cmd.contains("cargo install") {
+        return Some(CommandType::CargoInstall);
+    }
+    if lower_cmd.contains("cargo build") {
+        return Some(CommandType::CargoBuild);
+    }
+    if lower_cmd.contains("cargo test") {
+        return Some(CommandType::CargoTest);
+    }
+    // winget / choco / scoop
+    if lower_cmd.contains("winget install") {
+        return Some(CommandType::WingetInstall);
+    }
+    if lower_cmd.contains("choco install") || lower_cmd.contains("chocolatey install") {
+        return Some(CommandType::ChocoInstall);
+    }
+    if lower_cmd.contains("scoop install") {
+        return Some(CommandType::ScoopInstall);
+    }
+    // brew / apt-get
+    if lower_cmd.contains("brew install") {
+        return Some(CommandType::BrewInstall);
+    }
+    if lower_cmd.contains("apt-get install") || lower_cmd.contains("apt install") {
+        return Some(CommandType::AptGetInstall);
+    }
+    // dotnet
+    if lower_cmd.contains("dotnet restore") {
+        return Some(CommandType::DotnetRestore);
+    }
+    if lower_cmd.contains("dotnet build") {
+        return Some(CommandType::DotnetBuild);
+    }
+    // go
+    if lower_cmd.contains("go mod download") || lower_cmd.contains("go mod tidy") {
+        return Some(CommandType::GoModDownload);
+    }
+    if lower_cmd.contains("go install") {
+        return Some(CommandType::GoInstall);
+    }
+    if lower_cmd.contains("go build") || lower_cmd.contains("go run") {
+        return Some(CommandType::GoBuild);
+    }
+    // maven / gradle
+    if lower_cmd.contains("mvn ") || lower_cmd.contains("mvnw ") {
+        return Some(CommandType::MavenBuild);
+    }
+    if lower_cmd.contains("gradle ") || lower_cmd.contains("gradlew ") {
+        return Some(CommandType::GradleBuild);
+    }
+    // VS Code
+    if lower_cmd.contains("--install-extension") {
+        return Some(CommandType::VscodeExtInstall);
+    }
+
+    None
 }
 
 /// Attempt to extract a package/tool name from the command line.
@@ -1118,6 +1364,12 @@ pub fn start_scanner(
         eng.set_stop_signal(stop_signal);
         eng.is_running = true;
     }
+
+    // Start the Node.js systeminformation process monitor alongside the
+    // poll scanner. The Node.js detector uses systeminformation (a native
+    // WMI/COM wrapper) to poll the process list every 500ms, providing
+    // reliable command-line detection that doesn't depend on PEB reading.
+    start_node_monitor(Arc::clone(&engine), app_handle.clone());
 
     std::thread::spawn(move || {
         log::info!("Sandbox process scanner started");
@@ -1227,12 +1479,23 @@ pub fn start_scanner(
                 }
             }
 
-            // Throttle: sleep 2 s between scans (check stop signal during sleep)
-            for _ in 0..20 {
+            // Throttle: sleep 500ms between scans (reduced from 2s to catch
+            // short-lived processes like `npm install` that start and finish
+            // quickly). The WMI event monitor catches processes at creation
+            // time, but this fallback ensures coverage when WMI is unavailable.
+            for _ in 0..5 {
                 if thread_stop.load(Ordering::Relaxed) {
                     log::info!("Sandbox scanner stop requested during sleep — shutting down");
                     if let Ok(mut eng) = engine.lock() {
                         eng.is_running = false;
+                        // Kill the Node.js detector child by PID
+                        if let Some(pid) = eng.detector_pid.take() {
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &pid.to_string(), "/F"])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .spawn();
+                        }
                     }
                     return;
                 }
@@ -1242,12 +1505,156 @@ pub fn start_scanner(
     });
 }
 
+/// Start the Node.js systeminformation process monitor in a background thread.
+/// Spawns `node detector.mjs` which uses the `systeminformation` npm package
+/// to poll the Windows process list every 500ms. The `systeminformation` library
+/// uses native WMI/COM internally on Windows, giving it reliable access to
+/// process command lines that the Rust PEB reader may miss (especially for
+/// short-lived processes like `node.exe` running npm).
+///
+/// Detected operations are output as JSON lines to stdout, which we parse here
+/// and create DetectedOperation entries in the engine.
+fn start_node_monitor(
+    engine: Arc<Mutex<SandboxEngine>>,
+    app_handle: Option<tauri::AppHandle>,
+) {
+    std::thread::spawn(move || {
+        log::info!("Starting Node.js systeminformation process monitor");
+
+        // Resolve detector.mjs path at compile time (embedded as string literal)
+        let detector_path = concat!(env!("CARGO_MANIFEST_DIR"), "/detector.mjs");
+
+        let child = Command::new("node")
+            .arg(&detector_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to start Node.js detector: {e} (is Node.js installed?)");
+                log::warn!("Falling back to poll scanner only — npm install may not be detected");
+                return;
+            }
+        };
+
+        // Store the child PID so stop_scanner can kill it.
+        let child_pid = child.id();
+        if let Ok(mut eng) = engine.lock() {
+            eng.detector_pid = Some(child_pid);
+        }
+
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::io::BufReader::new(stdout);
+
+        // Spawn a separate thread to log stderr from the Node.js process
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let err_reader = std::io::BufReader::new(stderr);
+                for line in err_reader.lines() {
+                    if let Ok(l) = line {
+                        log::warn!("[node-detector] {}", l);
+                    }
+                }
+            });
+        }
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            // Parse JSON line from the detector
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("Failed to parse detector JSON: {e} — line: {}", line);
+                    continue;
+                }
+            };
+
+            let pid: u32 = match entry["pid"].as_u64() {
+                Some(p) => p as u32,
+                None => continue,
+            };
+            let exe_name = entry["exe"].as_str().unwrap_or("").to_string();
+            let cmdline = entry["cmd"].as_str().unwrap_or("").to_string();
+            let type_label = entry["type"].as_str().unwrap_or("");
+            let working_dir = entry["exePath"].as_str().unwrap_or("").to_string();
+
+            if exe_name.is_empty() || type_label.is_empty() {
+                continue;
+            }
+
+            let cmd_type = CommandType::from_label(type_label);
+            let package_name = extract_package_name(&cmd_type, &cmdline);
+
+            // Build operation under lock to get unique ID and dedup
+            let op = {
+                let mut eng = match engine.lock() {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                if eng.is_seen(pid, &cmdline) {
+                    continue;
+                }
+                eng.mark_seen(pid, &cmdline);
+
+                let now = Local::now().format("%H:%M:%S%.3f").to_string();
+                let op = DetectedOperation {
+                    id: eng.next_id(),
+                    command_type: cmd_type,
+                    command_line: cmdline,
+                    executable: exe_name,
+                    pid,
+                    detected_at: now,
+                    estimated_mb: 0.0,
+                    estimated_range_min_mb: 0.0,
+                    estimated_range_max_mb: 0.0,
+                    confidence: 0.0,
+                    status: "detected".to_string(),
+                    package_name,
+                    working_dir,
+                    ai_reasoning: String::new(),
+                };
+                eng.push_operation(op.clone());
+                op
+            };
+
+            // Emit Tauri event outside the lock
+            if let Some(ref handle) = app_handle {
+                if let Ok(payload) = serde_json::to_value(&op) {
+                    let _ = handle.emit("sandbox-operation-detected", payload);
+                    log::info!("Detected: {} (PID {})", op.command_type.label(), op.pid);
+                }
+            }
+        }
+
+        log::info!("Node.js detector process ended");
+    });
+}
+
 /// Request the background scanner thread to stop.
 /// Sets the stop signal; the thread will exit on its next iteration.
 pub fn stop_scanner(engine: &Arc<Mutex<SandboxEngine>>) {
     if let Ok(mut eng) = engine.lock() {
         if let Some(signal) = eng.take_stop_signal() {
             signal.store(true, Ordering::Relaxed);
+            // Kill the Node.js detector child by PID
+            if let Some(pid) = eng.detector_pid.take() {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
             log::info!("Sandbox scanner stop signal sent");
         } else {
             log::warn!("stop_scanner called but no stop signal found (scanner not running?)");
