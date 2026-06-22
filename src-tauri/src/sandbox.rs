@@ -226,7 +226,8 @@ struct GroqChatMessage {
 struct GroqResponseFormat {
     #[serde(rename = "type")]
     format_type: String,
-    json_schema: GroqJsonSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<GroqJsonSchema>,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,64 +680,89 @@ impl SandboxEngine {
 /// Call the Groq API to predict download size for a detected operation.
 /// Standalone free function so it can be called from the sync scanner thread
 /// via `tokio::runtime::Runtime::block_on` without holding the engine mutex.
-async fn groq_predict(api_key: &str, op: &DetectedOperation) -> Option<(f64, f64, f64, f64, String)> {
+async fn groq_predict(
+    client: &reqwest::Client,
+    api_key: &str,
+    op: &DetectedOperation
+) -> Option<(f64, f64, f64, f64, String)> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return None;
+    }
+
     let prompt = format!(
         r#"You are a download size estimator for developer tools.
-Given this command type and executable name, predict the total download size in megabytes (MB).
+Given this command line and metadata, predict the total download size in megabytes (MB).
 
 Command type: {command_type}
 Executable: {executable}
+Command line: {command_line}
+Package name: {package_name}
 
 Respond with a JSON object containing:
-- estimated_mb: best estimate in MB
-- range_min_mb: minimum likely download in MB  
-- range_max_mb: maximum likely download in MB
-- confidence: 0.0 to 1.0 confidence score
-- reasoning: short explanation for the estimate"#,
+- "estimated_mb": best estimate in MB (number)
+- "range_min_mb": minimum likely download in MB (number)
+- "range_max_mb": maximum likely download in MB (number)
+- "confidence": 0.0 to 1.0 confidence score (number)
+- "reasoning": short explanation for the estimate (string)
+
+Ensure you return valid JSON."#,
         command_type = op.command_type.label(),
         executable = op.executable,
+        command_line = op.command_line,
+        package_name = op.package_name,
     );
-
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "estimated_mb": { "type": "number" },
-            "range_min_mb": { "type": "number" },
-            "range_max_mb": { "type": "number" },
-            "confidence": { "type": "number" },
-            "reasoning": { "type": "string" }
-        },
-        "required": ["estimated_mb", "range_min_mb", "range_max_mb", "confidence", "reasoning"],
-        "additionalProperties": false
-    });
 
     let request = GroqRequest {
         model: "llama-3.3-70b-versatile".to_string(),
-        messages: vec![GroqChatMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-        response_format: GroqResponseFormat {
-            format_type: "json_schema".to_string(),
-            json_schema: GroqJsonSchema {
-                name: "download_estimate".to_string(),
-                strict: true,
-                schema,
+        messages: vec![
+            GroqChatMessage {
+                role: "system".to_string(),
+                content: "You are a specialized tool that estimates download sizes for developer commands. You always respond in valid JSON format.".into(),
             },
+            GroqChatMessage {
+                role: "user".to_string(),
+                content: prompt,
+            }
+        ],
+        response_format: GroqResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
         },
     };
 
-    let client = reqwest::Client::new();
     let response = client
         .post("https://api.groq.com/openai/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
+        .header("User-Agent", "DataGuardian/0.1.0")
         .json(&request)
         .send()
-        .await
-        .ok()?;
+        .await;
 
-    let groq_resp: GroqResponse = response.json().await.ok()?;
+    let response = match response {
+        Ok(res) => res,
+        Err(e) => {
+            log::error!("Groq API request failed: {}", e);
+            return None;
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let err_body = response.text().await.unwrap_or_else(|_| "Could not read error body".into());
+        log::error!("Groq API error ({}): {}", status, err_body);
+        return None;
+    }
+
+    let groq_resp: GroqResponse = match response.json().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::error!("Failed to parse Groq API response as JSON: {}", e);
+            return None;
+        }
+    };
+
     let content = groq_resp.choices.first()?.message.content.clone();
 
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -747,6 +773,7 @@ Respond with a JSON object containing:
         let reasoning = parsed.get("reasoning").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
         Some((estimated, range_min, range_max, conf, reasoning))
     } else {
+        log::warn!("Groq content was not valid JSON or missing fields: {}", content);
         None
     }
 }
@@ -1349,6 +1376,9 @@ pub fn start_scanner(
     std::thread::spawn(move || {
         log::info!("Sandbox process scanner started");
 
+        let rt = tokio::runtime::Runtime::new().ok();
+        let client = reqwest::Client::new();
+
         loop {
             // Check for stop signal
             if thread_stop.load(Ordering::Relaxed) {
@@ -1407,10 +1437,10 @@ pub fn start_scanner(
 
                 // ── Phase 2: try Groq AI on top if key is available ────
                 if let Some(ref api_key) = groq_api_key {
-                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    if let Some(ref tokio_rt) = rt {
                         for op in &ops_to_estimate {
                             if let Some((est, rmin, rmax, conf, reasoning)) =
-                                rt.block_on(groq_predict(api_key, op))
+                                tokio_rt.block_on(groq_predict(&client, api_key, op))
                             {
                                 log::info!("Groq estimate for {}: {:.1} MB (confidence {:.0}%)",
                                     op.command_type.label(), est, conf * 100.0);
@@ -1423,7 +1453,7 @@ pub fn start_scanner(
                             }
                         }
                     } else {
-                        log::warn!("Failed to create Tokio runtime for Groq; using local estimates");
+                        log::warn!("Tokio runtime unavailable for Groq; using local estimates");
                     }
                 }
 
