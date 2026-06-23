@@ -89,8 +89,6 @@ pub fn run() {
             commands::get_sandbox_operations,
             commands::clear_sandbox_operations,
             commands::estimate_command_size,
-            commands::create_sandbox_overlay,
-            commands::close_sandbox_overlay,
             commands::get_sandbox_status,
             commands::start_sandbox_scanner,
             commands::stop_sandbox_scanner,

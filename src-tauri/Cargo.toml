@@ -29,6 +29,7 @@ dotenvy = "0.15"
 # windows-sys: official Microsoft raw bindings (C ABI, no Option wrappers).
 # Deterministic signatures — no "windows crate" safe-wrapper ambiguity.
 [target.'cfg(windows)'.dependencies]
+winrt-toast-reborn = "0.3.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

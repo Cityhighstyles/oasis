@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use tauri::Emitter;
 use log;
 
+#[cfg(target_os = "windows")]
+use winrt_toast_reborn::{Toast, ToastManager, Action};
+
 // ── Supported command types ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -203,6 +206,8 @@ pub struct DetectedOperation {
     pub package_name: String,
     pub working_dir: String,
     pub ai_reasoning: String,
+    #[serde(skip)]
+    pub notification_sent: bool,
 }
 
 // ── Groq AI response types ────────────────────────────────────────────────
@@ -425,6 +430,7 @@ impl SandboxEngine {
                     package_name,
                     working_dir,
                     ai_reasoning: String::new(),
+                    notification_sent: false,
                 };
                 self.detected_operations.push(op.clone());
                 new_ops.push(op);
@@ -686,6 +692,39 @@ impl SandboxEngine {
         }
     }
 
+    /// Show a native Windows toast notification for a detected operation.
+    #[cfg(target_os = "windows")]
+    pub fn show_operation_notification(op: &DetectedOperation) {
+        let manager = ToastManager::new(ToastManager::POWERSHELL_AUM_ID);
+        let mut toast = Toast::new();
+
+        let title = format!("{} Detected", op.command_type.label());
+        let body = format!(
+            "Estimated Download: {:.1} MB\n{}",
+            op.estimated_mb,
+            if op.ai_reasoning.is_empty() {
+                "Local estimate based on command type."
+            } else {
+                &op.ai_reasoning
+            }
+        );
+
+        toast
+            .text1(title)
+            .text2(body)
+            .launch("action=open_dashboard")
+            .action(Action::new("Open Dashboard", "action=open_dashboard", ""))
+            .action(Action::new("Dismiss", "action=dismiss", ""));
+
+        if let Err(e) = manager.show(&toast) {
+            log::error!("Failed to show toast notification: {:?}", e);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn show_operation_notification(_op: &DetectedOperation) {
+        // No-op on non-Windows platforms
+    }
 }
 
 // ── Standalone Groq API helper ───────────────────────────────────────────
@@ -1486,6 +1525,12 @@ pub fn start_scanner(
                                     let _ = handle.emit("sandbox-operation-updated", payload);
                                 }
                             }
+
+                            // Show native notification if not already sent
+                            if !op.notification_sent {
+                                op.notification_sent = true;
+                                SandboxEngine::show_operation_notification(op);
+                            }
                         }
                     }
                 }
@@ -1635,6 +1680,7 @@ fn start_node_monitor(
                     package_name,
                     working_dir,
                     ai_reasoning: String::new(),
+                    notification_sent: false,
                 };
                 eng.push_operation(op.clone());
                 op

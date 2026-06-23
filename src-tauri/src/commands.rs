@@ -293,57 +293,6 @@ pub fn estimate_command_size(
     }))
 }
 
-/// Create a transparent, borderless overlay webview window for a sandbox operation.
-/// The window displays live info about the detected operation and lets the user
-/// interact with it.
-#[tauri::command]
-pub fn create_sandbox_overlay(
-    app: tauri::AppHandle,
-    operation_id: String,
-) -> Result<(), String> {
-    let label = format!("sandbox-overlay-{}", operation_id.replace('.', "-"));
-    let window = WebviewWindowBuilder::new(
-        &app,
-        &label,
-        WebviewUrl::App("index.html".into()),
-    )
-    .title("Sandbox Overlay")
-    .inner_size(420.0, 340.0)
-    .min_inner_size(320.0, 260.0)
-    .transparent(true)
-    .decorations(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .center()
-    .build()
-    .map_err(|e| format!("Failed to create overlay window: {e}"))?;
-
-    // Set the operation ID on the window so the SandboxOverlay component
-    // can read it via its __SANDBOX_OP_ID__ fallback mechanism. The overlay
-    // window stays at index.html — no URL navigation needed, avoiding SPA
-    // asset resolution issues in production builds.
-    let _ = window.eval(&format!(
-        r#"window.__SANDBOX_OP_ID__ = '{}';"#,
-        operation_id
-    ));
-
-    Ok(())
-}
-
-/// Close a sandbox overlay window by operation ID.
-#[tauri::command]
-pub fn close_sandbox_overlay(
-    app: tauri::AppHandle,
-    operation_id: String,
-) -> Result<(), String> {
-    let label = format!("sandbox-overlay-{}", operation_id.replace('.', "-"));
-    if let Some(window) = app.webview_windows().get(&label).cloned() {
-        window
-            .close()
-            .map_err(|e| format!("Failed to close overlay: {e}"))?;
-    }
-    Ok(())
-}
 
 /// Start the sandbox process scanner. If already running, this is a no-op.
 #[tauri::command]
