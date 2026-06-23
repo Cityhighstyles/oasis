@@ -174,6 +174,14 @@ export function DevSandbox() {
             ...prev,
             `[${event.payload.detectedAt}] AI Estimate: ${event.payload.commandType.label} → ${event.payload.estimatedMb.toFixed(1)} MB`,
           ])
+        } else if (event.payload.status === "killed") {
+          setLogLines((prev) => [
+            ...prev,
+            `[${new Date().toLocaleTimeString()}] TERMINATED: ${event.payload.commandType.label} (PID ${event.payload.pid}) by user request`,
+          ])
+          toast.error(`${event.payload.commandType.label} Terminated`, {
+            description: `Process (PID ${event.payload.pid}) was killed.`,
+          })
         }
       })
       unlistenRef.current.push(u2)
@@ -672,6 +680,7 @@ export function DevSandbox() {
               operations.map((op) => {
                 const Icon = ICON_MAP[op.commandType.icon] || Terminal
                 const isEstimated = op.status === "estimated"
+                const isKilled = op.status === "killed"
                 const hasPackage = op.packageName && op.packageName.length > 0
                 const hasWorkingDir = op.workingDir && op.workingDir.length > 0
 
@@ -713,11 +722,22 @@ export function DevSandbox() {
                                 "inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider",
                                 isEstimated
                                   ? "bg-neon-emerald/10 text-neon-emerald border border-neon-emerald/20"
-                                  : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                                  : isKilled
+                                    ? "bg-destructive/10 text-destructive border border-destructive/20"
+                                    : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
                               )}
                             >
-                              <span className={cn("size-1 rounded-full", isEstimated ? "bg-neon-emerald" : "bg-amber-400 animate-pulse")} />
-                              {isEstimated ? "Estimated" : "Detecting"}
+                              <span
+                                className={cn(
+                                  "size-1 rounded-full",
+                                  isEstimated
+                                    ? "bg-neon-emerald"
+                                    : isKilled
+                                      ? "bg-destructive"
+                                      : "bg-amber-400 animate-pulse"
+                                )}
+                              />
+                              {isEstimated ? "Estimated" : isKilled ? "Terminated" : "Detecting"}
                             </span>
                           </div>
                           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
@@ -803,12 +823,22 @@ export function DevSandbox() {
                         </div>
                       )}
 
-                      {/* Not yet estimated */}
-                      {!isEstimated && (
+                      {/* Not yet estimated and not killed */}
+                      {!isEstimated && !isKilled && (
                         <div className="ml-12 flex items-center gap-2">
                           <Loader2 className="size-3 text-amber-400 animate-spin" />
                           <span className="text-[9px] text-muted-foreground">
                             Estimating download size...
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Killed indicator */}
+                      {isKilled && (
+                        <div className="ml-12 flex items-center gap-2">
+                          <AlertTriangle className="size-3 text-destructive" />
+                          <span className="text-[9px] text-destructive font-medium">
+                            Process terminated by user request.
                           </span>
                         </div>
                       )}
@@ -858,13 +888,15 @@ export function DevSandbox() {
                           "transition-colors",
                           line.includes("ACTIVE") || line.includes("started")
                             ? "text-amber-400"
-                            : line.includes("restored") || line.includes("re-applied") || line.includes("auto-restored")
-                              ? "text-neon-emerald"
-                              : line.includes("Estimate") || line.includes("AI")
-                                ? "text-neon-cyan"
-                                : line.includes("Detected")
-                                  ? "text-amber-300"
-                                  : "text-muted-foreground"
+                            : line.includes("TERMINATED")
+                              ? "text-destructive font-bold"
+                              : line.includes("restored") || line.includes("re-applied") || line.includes("auto-restored")
+                                ? "text-neon-emerald"
+                                : line.includes("Estimate") || line.includes("AI")
+                                  ? "text-neon-cyan"
+                                  : line.includes("Detected")
+                                    ? "text-amber-300"
+                                    : "text-muted-foreground"
                         )}
                       >
                         {line}

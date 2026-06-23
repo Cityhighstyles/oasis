@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use chrono::Local;
 use serde::{Deserialize, Serialize, Serializer};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use log;
 
 #[cfg(target_os = "windows")]
@@ -694,8 +694,7 @@ impl SandboxEngine {
 
     /// Show a native Windows toast notification for a detected operation.
     #[cfg(target_os = "windows")]
-    pub fn show_operation_notification(op: &DetectedOperation) {
-        let manager = ToastManager::new(ToastManager::POWERSHELL_AUM_ID);
+    pub fn show_operation_notification(manager: &ToastManager, op: &DetectedOperation) {
         let mut toast = Toast::new();
 
         let title = format!("{} Detected", op.command_type.label());
@@ -710,9 +709,11 @@ impl SandboxEngine {
         );
 
         toast
+            .tag(&op.id)
             .text1(title)
             .text2(body)
             .launch("action=open_dashboard")
+            .action(Action::new("Kill Process", &format!("kill:{}", op.id), ""))
             .action(Action::new("Open Dashboard", "action=open_dashboard", ""))
             .action(Action::new("Dismiss", "action=dismiss", ""));
 
@@ -722,7 +723,7 @@ impl SandboxEngine {
     }
 
     #[cfg(not(target_os = "windows"))]
-    pub fn show_operation_notification(_op: &DetectedOperation) {
+    pub fn show_operation_notification(_manager: &(), _op: &DetectedOperation) {
         // No-op on non-Windows platforms
     }
 }
@@ -1440,6 +1441,51 @@ pub fn start_scanner(
         let rt = tokio::runtime::Runtime::new().ok();
         let client = reqwest::Client::new();
 
+        #[cfg(target_os = "windows")]
+        let manager = {
+            let engine_clone = Arc::clone(&engine);
+            let handle_clone = app_handle.clone();
+            ToastManager::new(ToastManager::POWERSHELL_AUM_ID)
+                .on_activated(None, move |action| {
+                    if let Some(action) = action {
+                        if action.arg.starts_with("kill:") {
+                            let op_id = &action.arg[5..];
+                            log::info!("Toast action: killing operation {}", op_id);
+
+                            let mut pid_to_kill = None;
+                            let mut op_to_update = None;
+
+                            if let Ok(mut eng) = engine_clone.lock() {
+                                if let Some(op) = eng.detected_operations.iter_mut().find(|o| o.id == op_id) {
+                                    pid_to_kill = Some(op.pid);
+                                    op.status = "killed".to_string();
+                                    op_to_update = Some(op.clone());
+                                }
+                            }
+
+                            if let Some(pid) = pid_to_kill {
+                                if let Err(e) = crate::procctl::kill_process(pid) {
+                                    log::error!("Failed to kill process {}: {}", pid, e);
+                                }
+                            }
+
+                            if let (Some(handle), Some(op)) = (&handle_clone, op_to_update) {
+                                let _ = handle.emit("sandbox-operation-updated", op);
+                            }
+                        } else if action.arg == "action=open_dashboard" {
+                            if let Some(handle) = &handle_clone {
+                                if let Some(window) = handle.get_webview_window("main") {
+                                    let _ = window.set_focus();
+                                }
+                            }
+                        }
+                    }
+                })
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let manager = ();
+
         loop {
             // Check for stop signal
             if thread_stop.load(Ordering::Relaxed) {
@@ -1522,6 +1568,12 @@ pub fn start_scanner(
                 if let Ok(mut eng) = engine.lock() {
                     for (id, est, rmin, rmax, conf, reasoning) in &estimates {
                         if let Some(op) = eng.detected_operations.iter_mut().find(|o| o.id == *id) {
+                            // Only update status if it hasn't been changed (e.g. to "killed")
+                            // by a notification action while we were estimating.
+                            if op.status != "detected" {
+                                continue;
+                            }
+
                             op.estimated_mb = *est;
                             op.estimated_range_min_mb = *rmin;
                             op.estimated_range_max_mb = *rmax;
@@ -1538,7 +1590,7 @@ pub fn start_scanner(
                             // Show native notification if not already sent
                             if !op.notification_sent {
                                 op.notification_sent = true;
-                                SandboxEngine::show_operation_notification(op);
+                                SandboxEngine::show_operation_notification(&manager, op);
                             }
                         }
                     }
