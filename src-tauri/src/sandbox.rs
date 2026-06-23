@@ -1381,7 +1381,7 @@ fn classify_shell_cmdline(lower_cmd: &str) -> Option<CommandType> {
 
 /// Attempt to extract a package/tool name from the command line.
 /// e.g. "npm install express" → "express", "pip install torch" → "torch"
-fn extract_package_name(cmd_type: &CommandType, cmdline: &str) -> String {
+fn extract_package_name(_cmd_type: &CommandType, cmdline: &str) -> String {
     if cmdline.is_empty() {
         return String::new();
     }

@@ -4,7 +4,6 @@ import {
   Wifi,
   TrendingDown,
   Zap,
-  AlertTriangle,
   AlertCircle,
   Gauge,
   ScrollText,
@@ -21,6 +20,7 @@ import {
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { AlertTriangle, CalendarDays } from "lucide-react"
 import { Progress } from "@/components/ui/progress"
 import { useShield } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
@@ -156,12 +156,15 @@ interface SandboxStatus {
 }
 
 export function Dashboard() {
-  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, privacyAssessments, overallPrivacyScore } =
+  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, privacyAssessments, overallPrivacyScore, budgetSettings, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, thresholdsHitToday } =
     useShield()
 
-  const pct = Math.round((dataBudgetUsed / dataBudgetTotal) * 100)
-  const remaining = dataBudgetTotal - dataBudgetUsed
+  const pct = Math.round((dataBudgetUsed / Math.max(dataBudgetTotal, 1)) * 100)
+  const remaining = Math.max(0, dataBudgetTotal - dataBudgetUsed)
   const savedMB = Math.max(0, dataBudgetTotal - dataBudgetUsed)
+  const budgetExceeded = dailyUsedMB >= budgetSettings.dailyLimitMB
+  const budgetWarning = !budgetExceeded && dailyUsedMB >= budgetSettings.dailyLimitMB * 0.8
+  const weeklyExceeded = weeklyUsedMB >= budgetSettings.weeklyLimitMB
 
   const activeProcesses = processes.filter((p) => p.status === "active").length
   const totalProcesses = processes.length
@@ -225,11 +228,41 @@ export function Dashboard() {
       {/* Top row */}
       <div className="grid grid-cols-3 gap-4">
         {/* Data Budget Card */}
-        <Card className="col-span-1 border-border bg-card">
+        <Card className={cn(
+          "col-span-1 border transition-all duration-300",
+          budgetExceeded ? "border-destructive/30 bg-destructive/5" :
+          budgetWarning ? "border-amber-500/20 bg-amber-500/5" :
+          "border-border bg-card"
+        )}>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Today's Data Budget
-            </CardTitle>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                Today's Data Budget
+              </CardTitle>
+              <div className="flex items-center gap-1.5">
+                {weeklyExceeded && (
+                  <Badge
+                    variant="outline"
+                    className="text-[9px] h-5 gap-1 border-neon-cyan/30 text-neon-cyan"
+                  >
+                    <CalendarDays className="size-2.5" />
+                    Weekly Exceeded
+                  </Badge>
+                )}
+                {(budgetExceeded || budgetWarning) && (
+                  <Badge
+                    variant={budgetExceeded ? "destructive" : "outline"}
+                    className={cn(
+                      "text-[9px] h-5 gap-1",
+                      !budgetExceeded && "border-amber-500/30 text-amber-400"
+                    )}
+                  >
+                    <AlertTriangle className="size-3" />
+                    {budgetExceeded ? "Exceeded" : "Near Limit"}
+                  </Badge>
+                )}
+              </div>
+            </div>
           </CardHeader>
           <CardContent className="flex flex-col items-center gap-4">
             <DataBudgetRing used={dataBudgetUsed} total={dataBudgetTotal} />
@@ -240,18 +273,38 @@ export function Dashboard() {
               </div>
               <Progress
                 value={pct}
-                className="h-1.5 bg-border"
+                className={cn(
+                  "h-1.5",
+                  budgetExceeded ? "bg-destructive/20" :
+                  budgetWarning ? "bg-amber-500/20" :
+                  "bg-border"
+                )}
               />
             </div>
             <div className="grid grid-cols-2 gap-2 w-full">
               <div className="rounded-md bg-muted/50 px-3 py-2 text-center">
                 <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Used</p>
-                <p className="text-sm font-semibold text-foreground">{dataBudgetUsed} MB</p>
+                <p className={cn(
+                  "text-sm font-semibold",
+                  budgetExceeded ? "text-destructive" :
+                  budgetWarning ? "text-amber-400" :
+                  "text-foreground"
+                )}>{dataBudgetUsed} MB</p>
               </div>
               <div className="rounded-md bg-neon-emerald/5 border border-neon-emerald/20 px-3 py-2 text-center">
                 <p className="text-[10px] text-neon-emerald/70 uppercase tracking-wider">Saved</p>
                 <p className="text-sm font-semibold text-neon-emerald">{savedMB} MB</p>
               </div>
+            </div>
+            <div className="flex items-center justify-between gap-2 w-full text-[9px]">
+              <span className="text-muted-foreground/50">
+                Monthly: <span className="font-mono tabular-nums text-foreground/70">{monthlyUsedMB} MB</span>
+                <span className="text-muted-foreground/30"> / {budgetSettings.monthlyLimitMB} MB</span>
+              </span>
+              {thresholdsHitToday.length > 0 && (
+                <span className="text-amber-400/70">                    {thresholdsHitToday.map(t => `${t}%`).join(", ")} thresholds hit
+                </span>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -427,6 +480,11 @@ export function Dashboard() {
                   <p className="text-[10px] text-muted-foreground/60">
                     {isFocusMode ? "In session" : `${todayFocusMinutes}m today`}
                   </p>
+                  {focusStreak > 0 && (
+                    <p className="text-[9px] text-violet-400/70 mt-0.5">
+                      🔥 {focusStreak} day streak
+                    </p>
+                  )}
                 </div>
               </CardContent>
             </Card>

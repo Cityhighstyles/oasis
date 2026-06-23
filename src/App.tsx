@@ -8,6 +8,7 @@ import { DevSandbox } from "@/pages/DevSandbox"
 import { Focus } from "@/pages/Focus"
 import { Privacy } from "@/pages/Privacy"
 import { Climate } from "@/pages/Climate"
+import { DataBudget } from "@/pages/DataBudget"
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route index element={<Dashboard />} />
             <Route path="/climate" element={<Climate />} />
+            <Route path="/budget" element={<DataBudget />} />
             <Route path="/focus" element={<Focus />} />
             <Route path="/privacy" element={<Privacy />} />
             <Route path="/rules" element={<RulesControls />} />

@@ -7,6 +7,7 @@ import {
   Brain,
   ShieldAlert,
   Globe,
+  Gauge,
   Shield,
   ShieldOff,
   Wifi,
@@ -21,6 +22,7 @@ import { cn } from "@/lib/utils"
 const NAV_ITEMS = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/climate", icon: Globe, label: "Climate Impact" },
+  { to: "/budget", icon: Gauge, label: "Data Budget" },
   { to: "/focus", icon: Brain, label: "Digital Wellness" },
   { to: "/privacy", icon: ShieldAlert, label: "Privacy Sentinel" },
   { to: "/rules", icon: SlidersHorizontal, label: "Rules & Controls" },

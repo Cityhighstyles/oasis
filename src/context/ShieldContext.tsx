@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react"
+  import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react"
+import { toast } from "sonner"
 import { invoke } from "@tauri-apps/api/core"
 
 export type ProcessStatus = "blocked" | "active" | "monitoring"
@@ -74,6 +75,85 @@ export interface FocusSession {
   distractionsBlocked: number
 }
 
+// ── Data Budget types ─────────────────────────────────────────────────────
+
+export type BudgetExceedAction = "notify_only" | "block_non_essential" | "block_all"
+
+export interface DataBudgetSettings {
+  dailyLimitMB: number
+  weeklyLimitMB: number
+  monthlyLimitMB: number
+  /** Notification thresholds as percentages (e.g. [50, 75, 90, 100]) */
+  thresholds: number[]
+  /** What to do when budget is exceeded */
+  onExceed: BudgetExceedAction
+  /** Executable names that are essential and should never be auto-blocked */
+  essentialApps: string[]
+}
+
+export interface DataBudgetPerProcess {
+  exe: string
+  name: string
+  usageMB: number
+}
+
+export interface DataBudgetStatus {
+  dailyUsedMB: number
+  dailyLimitMB: number
+  weeklyUsedMB: number
+  weeklyLimitMB: number
+  monthlyUsedMB: number
+  monthlyLimitMB: number
+  /** Which thresholds have been hit today (to avoid re-triggering) */
+  thresholdsHit: number[]
+  /** Whether the daily budget is currently exceeded */
+  dailyExceeded: boolean
+  /** Whether the weekly budget is currently exceeded */
+  weeklyExceeded: boolean
+  /** Whether the monthly budget is currently exceeded */
+  monthlyExceeded: boolean
+  /** Per-process breakdown */
+  perProcess: DataBudgetPerProcess[]
+}
+
+/** Per-app data limit configuration */
+export interface PerAppBudget {
+  /** Executable name to match (e.g. "chrome.exe") */
+  exe: string
+  /** Display name */
+  name: string
+  /** Daily data limit in MB (0 = no limit) */
+  limitMB: number
+  /** Whether this app should be blocked when it exceeds its limit */
+  autoBlock: boolean
+}
+
+/** Snapshot of data usage at a point in time (for timeline charts). */
+export interface DataBudgetSnapshot {
+  /** ISO timestamp */
+  timestamp: string
+  /** Cumulative MB used at this point */
+  usageMB: number
+}
+
+const DEFAULT_BUDGET_SETTINGS: DataBudgetSettings = {
+  dailyLimitMB: 500,
+  weeklyLimitMB: 3500,
+  monthlyLimitMB: 10000,
+  thresholds: [50, 75, 90, 100],
+  onExceed: "notify_only",
+  essentialApps: [
+    "svchost.exe",
+    "msmpeng.exe",
+    "services.exe",
+    "lsass.exe",
+    "csrss.exe",
+    "winlogon.exe",
+    "system",
+    "idle",
+  ],
+}
+
 // ── Privacy Sentinel types ────────────────────────────────────────────────────
 
 /** Privacy risk level for an app */
@@ -127,6 +207,20 @@ type ShieldContextType = {
   toggleShield: () => void
   dataBudgetUsed: number
   dataBudgetTotal: number
+  // ── Data Budget settings ──────────────────────────────────────────
+  budgetSettings: DataBudgetSettings
+  dailyUsedMB: number
+  weeklyUsedMB: number
+  monthlyUsedMB: number
+  thresholdsHitToday: number[]
+  budgetHistory: DataBudgetSnapshot[]
+  clearBudgetHistory: () => void
+  perAppBudgets: PerAppBudget[]
+  setPerAppBudget: (exe: string, name: string, limitMB: number, autoBlock: boolean) => void
+  removePerAppBudget: (exe: string) => void
+  updateBudgetSettings: (settings: Partial<DataBudgetSettings>) => void
+  resetDataBudget: () => Promise<void>
+  getBudgetStatus: () => DataBudgetStatus
   lastHotspotDetected: string | null
   firewallStatus: "active" | "inactive" | "partial"
   wfpAvailable: boolean
@@ -254,6 +348,76 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     setCarbonHistory([])
     localStorage.removeItem("carbon_history")
   }, [])
+
+  // ── Process action callbacks (defined early to avoid TDZ issues) ────────
+  const refreshProcesses = useCallback(async () => {
+    try {
+      const liveData: ProcessEntry[] = await invoke("get_live_processes")
+      setProcesses(liveData)
+      const totalSessionData = liveData.reduce((sum, p) => sum + p.sessionData, 0)
+      setDataBudgetUsed(Math.round(totalSessionData))
+    } catch (err) {
+      console.error("Failed to fetch live processes:", err)
+    }
+  }, [])
+
+  const refreshWfpStatus = useCallback(async () => {
+    try {
+      const available = await invoke<boolean>("get_wfp_status")
+      setWfpAvailable(available)
+      setFirewallStatus(available ? "active" : "inactive")
+    } catch (err) {
+      console.error("Failed to fetch WFP status:", err)
+      setWfpAvailable(false)
+      setFirewallStatus("inactive")
+    }
+  }, [])
+
+  const blockApp = useCallback(async (exePath: string) => {
+    try {
+      await invoke("toggle_process_shield", { exePath, block: true })
+      await refreshProcesses()
+    } catch (err) {
+      console.error("Failed to block app:", err)
+      throw err
+    }
+  }, [refreshProcesses])
+
+  const unblockApp = useCallback(async (exePath: string) => {
+    try {
+      await invoke("toggle_process_shield", { exePath, block: false })
+      await refreshProcesses()
+    } catch (err) {
+      console.error("Failed to unblock app:", err)
+      throw err
+    }
+  }, [refreshProcesses])
+
+  const refreshSuspendedPids = useCallback(async () => {
+    try {
+      const pids: number[] = await invoke("get_suspended_pids")
+      setSuspendedPids(new Set(pids))
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  const suspendProcess = useCallback(async (pid: number) => {
+    const count: number = await invoke("suspend_process", { pid })
+    await refreshSuspendedPids()
+    return count
+  }, [])
+
+  const resumeProcess = useCallback(async (pid: number) => {
+    const count: number = await invoke("resume_process", { pid })
+    await refreshSuspendedPids()
+    return count
+  }, [])
+
+  const killProcess = useCallback(async (pid: number) => {
+    await invoke("kill_process", { pid })
+    await refreshProcesses()
+  }, [refreshProcesses])
 
   // ── Focus / Digital Wellness state ──────────────────────────────────────
   const DEFAULT_DISTRACTING_APPS: DistractingApp[] = [
@@ -428,6 +592,377 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem("focus_today_date")
     localStorage.removeItem("focus_streak")
   }, [])
+
+  // ── Data Budget state ─────────────────────────────────────────────────────
+  const [budgetSettings, setBudgetSettings] = useState<DataBudgetSettings>(() => {
+    try {
+      const saved = localStorage.getItem("budget_settings")
+      return saved ? JSON.parse(saved) : DEFAULT_BUDGET_SETTINGS
+    } catch { return DEFAULT_BUDGET_SETTINGS }
+  })
+
+  // Persist budget settings
+  useEffect(() => {
+    localStorage.setItem("budget_settings", JSON.stringify(budgetSettings))
+  }, [budgetSettings])
+
+  // Track daily, weekly & monthly usage with localStorage persistence and auto-rollover
+  const [dailyUsedMB, setDailyUsedMB] = useState(() => {
+    try {
+      const savedDate = localStorage.getItem("budget_daily_date")
+      const today = new Date().toDateString()
+      if (savedDate !== today) {
+        localStorage.removeItem("budget_daily_used")
+        localStorage.setItem("budget_daily_date", today)
+        return 0
+      }
+      return Number(localStorage.getItem("budget_daily_used")) || 0
+    } catch { return 0 }
+  })
+
+  const [weeklyUsedMB, setWeeklyUsedMB] = useState(() => {
+    try {
+      const savedWeek = localStorage.getItem("budget_weekly_key")
+      const now = new Date()
+      const startOfYear = new Date(now.getFullYear(), 0, 1)
+      const days = Math.floor((now.getTime() - startOfYear.getTime()) / 86400000)
+      const week = Math.ceil((days + startOfYear.getDay() + 1) / 7)
+      const currentWeek = `${now.getFullYear()}-W${String(week).padStart(2, "0")}`
+      if (savedWeek !== currentWeek) {
+        localStorage.removeItem("budget_weekly_used")
+        localStorage.setItem("budget_weekly_key", computedWeek)
+        return 0
+      }
+      return Number(localStorage.getItem("budget_weekly_used")) || 0
+    } catch { return 0 }
+  })
+
+  const [monthlyUsedMB, setMonthlyUsedMB] = useState(() => {
+    try {
+      const savedMonth = localStorage.getItem("budget_monthly_key")
+      const currentMonth = `${new Date().getFullYear()}-${new Date().getMonth()}`
+      if (savedMonth !== currentMonth) {
+        localStorage.removeItem("budget_monthly_used")
+        localStorage.setItem("budget_monthly_key", currentMonth)
+        return 0
+      }
+      return Number(localStorage.getItem("budget_monthly_used")) || 0
+    } catch { return 0 }
+  })
+
+  // Track which thresholds we've already notified about today
+  const [thresholdsHitToday, setThresholdsHitToday] = useState<number[]>(() => {
+    try {
+      const saved = localStorage.getItem("budget_thresholds_hit")
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+
+  // Track which non-essential apps have been auto-blocked due to budget
+  const budgetBlockedAppsRef = useRef<string[]>([])
+
+  // Helper to persist daily/monthly usage
+  const persistUsage = useCallback(() => {
+    // Daily is saved via effect, but we also sync on refresh
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem("budget_daily_used", String(dailyUsedMB))
+  }, [dailyUsedMB])
+
+  useEffect(() => {
+    localStorage.setItem("budget_weekly_used", String(weeklyUsedMB))
+  }, [weeklyUsedMB])
+
+  useEffect(() => {
+    localStorage.setItem("budget_monthly_used", String(monthlyUsedMB))
+  }, [monthlyUsedMB])
+
+  useEffect(() => {
+    localStorage.setItem("budget_thresholds_hit", JSON.stringify(thresholdsHitToday))
+  }, [thresholdsHitToday])
+
+  // DataBudget notification + auto-blocking — runs every time processes update
+  const lastBudgetCheckRef = useRef(0)
+  useEffect(() => {
+    const totalMB = processes.reduce((sum, p) => sum + p.sessionData, 0)
+
+    // Throttle checks to every 5 seconds
+    const now = Date.now()
+    if (now - lastBudgetCheckRef.current < 5000) return
+    lastBudgetCheckRef.current = now
+
+    // Update daily, weekly & monthly usage from the *max* of current processes + any previously recorded
+    setDailyUsedMB((prev) => Math.max(Math.round(totalMB), prev))
+    setWeeklyUsedMB((prev) => Math.max(Math.round(totalMB), prev))
+    setMonthlyUsedMB((prev) => Math.max(Math.round(totalMB), prev))
+
+    // Check thresholds
+    const dailyPct = (totalMB / Math.max(budgetSettings.dailyLimitMB, 1)) * 100
+    const weeklyPct = (totalMB / Math.max(budgetSettings.weeklyLimitMB, 1)) * 100
+    const monthlyPct = (totalMB / Math.max(budgetSettings.monthlyLimitMB, 1)) * 100
+
+    // Track which budget(s) crossed each threshold for correct notification text
+    type ThresholdSource = { threshold: number; source: string }
+    const thresholdSources: ThresholdSource[] = []
+    for (const threshold of budgetSettings.thresholds) {
+      if (!thresholdsHitToday.includes(threshold)) {
+        const dailyHit = dailyPct >= threshold
+        const weeklyHit = weeklyPct >= threshold
+        const monthlyHit = monthlyPct >= threshold
+        const parts: string[] = []
+        if (dailyHit) parts.push('daily')
+        if (weeklyHit) parts.push('weekly')
+        if (monthlyHit) parts.push('monthly')
+        if (parts.length > 0) {
+          thresholdSources.push({ threshold, source: parts.join(' and ') })
+        }
+      }
+    }
+
+    for (const { threshold, source } of thresholdSources) {
+      if (threshold < 100) {
+        toast.warning(`Data Budget: ${threshold}% used`, {
+          description: `You've used ${threshold}% of your ${source} data limit (${totalMB.toFixed(0)} MB).`,
+          duration: 6000,
+        })
+      } else {
+        // Exceeded — use error toast
+        const exceeded = dailyPct >= 100 ? "daily" : weeklyPct >= 100 ? "weekly" : "monthly"
+        toast.error(`Data Budget Exceeded!`, {
+          description: `Your ${exceeded} data limit has been reached (${totalMB.toFixed(0)} MB).`,
+          duration: 8000,
+        })
+
+        // Auto-block based on action setting
+        if (budgetSettings.onExceed !== "notify_only") {
+          toast.info(`Auto-blocking apps...`, {
+            description: `Budget exceeded — blocking ${budgetSettings.onExceed === 'block_all' ? 'all network traffic' : 'non-essential apps'}.`,
+            duration: 4000,
+          })
+          // We trigger the blocking asynchronously
+          setTimeout(() => {
+            enforceBudgetBlock(totalMB)
+          }, 500)
+        }
+      }
+    }
+
+    // Collapse newlyHit from the new thresholdSources
+    const newlyHit = thresholdSources.map(s => s.threshold)
+
+    if (newlyHit.length > 0) {
+      setThresholdsHitToday((prev) => {
+        const updated = [...new Set([...prev, ...newlyHit])]
+        return updated
+      })
+    }
+
+    // Check per-app limits
+    enforcePerAppLimits()
+
+    // Check if usage has gone down (e.g. reset), clear thresholds
+    if (totalMB === 0 && thresholdsHitToday.length > 0) {
+      setThresholdsHitToday([])
+      // Unblock any previously budget-blocked apps
+      unblockBudgetBlockedApps()
+    }
+  }, [processes, budgetSettings, thresholdsHitToday, enforceBudgetBlock, enforcePerAppLimits])
+
+  const enforceBudgetBlock = useCallback(async (currentMB: number) => {
+    const exceeded = currentMB >= budgetSettings.dailyLimitMB
+    if (!exceeded) {
+      // Unblock if we previously blocked
+      await unblockBudgetBlockedApps()
+      return
+    }
+
+    if (budgetSettings.onExceed === "block_all") {
+      // Block ALL processes — hard network stop
+      for (const app of processes) {
+        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
+          try {
+            await blockApp(app.exe)
+            budgetBlockedAppsRef.current.push(app.exe)
+          } catch {
+            // Skip
+          }
+        }
+      }
+    } else if (budgetSettings.onExceed === "block_non_essential") {
+      // Block only non-essential apps (skip those in the essential list)
+      const appsToBlock = processes.filter(
+        p => !budgetSettings.essentialApps.some(e => p.exe.toLowerCase().includes(e.toLowerCase()))
+      )
+      for (const app of appsToBlock) {
+        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
+          try {
+            await blockApp(app.exe)
+            budgetBlockedAppsRef.current.push(app.exe)
+          } catch {
+            // Skip
+          }
+        }
+      }
+    }
+  }, [processes, budgetSettings, blockApp])
+
+  const unblockBudgetBlockedApps = useCallback(async () => {
+    for (const exe of budgetBlockedAppsRef.current) {
+      try {
+        await unblockApp(exe)
+      } catch {
+        // Skip
+      }
+    }
+    budgetBlockedAppsRef.current = []
+  }, [unblockApp])
+
+  const updateBudgetSettings = useCallback((settings: Partial<DataBudgetSettings>) => {
+    setBudgetSettings((prev) => ({ ...prev, ...settings }))
+  }, [])
+
+  const getBudgetStatus = useCallback((): DataBudgetStatus => {
+    const totalMB = processes.reduce((sum, p) => sum + p.sessionData, 0)
+    return {
+      dailyUsedMB,
+      dailyLimitMB: budgetSettings.dailyLimitMB,
+      weeklyUsedMB,
+      weeklyLimitMB: budgetSettings.weeklyLimitMB,
+      monthlyUsedMB,
+      monthlyLimitMB: budgetSettings.monthlyLimitMB,
+      thresholdsHit: thresholdsHitToday,
+      dailyExceeded: dailyUsedMB >= budgetSettings.dailyLimitMB,
+      weeklyExceeded: weeklyUsedMB >= budgetSettings.weeklyLimitMB,
+      monthlyExceeded: monthlyUsedMB >= budgetSettings.monthlyLimitMB,
+      perProcess: processes
+        .sort((a, b) => b.sessionData - a.sessionData)
+        .slice(0, 20)
+        .map(p => ({ exe: p.exe, name: p.name, usageMB: p.sessionData })),
+    }
+  }, [processes, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, budgetSettings, thresholdsHitToday])
+
+  // ── Per-app budget limits ───────────────────────────────────────────────
+  const [perAppBudgets, setPerAppBudgets] = useState<PerAppBudget[]>(() => {
+    try {
+      const saved = localStorage.getItem("budget_per_app")
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+
+  // Persist per-app budgets
+  useEffect(() => {
+    localStorage.setItem("budget_per_app", JSON.stringify(perAppBudgets))
+  }, [perAppBudgets])
+
+  // Track which apps have been auto-blocked due to per-app limits
+  const perAppBlockedExesRef = useRef<string[]>([])
+
+  const setPerAppBudget = useCallback((exe: string, name: string, limitMB: number, autoBlock: boolean) => {
+    setPerAppBudgets((prev) => {
+      const existing = prev.findIndex(p => p.exe === exe)
+      if (existing >= 0) {
+        const updated = [...prev]
+        updated[existing] = { ...updated[existing], limitMB, autoBlock }
+        return updated
+      }
+      return [...prev, { exe, name, limitMB, autoBlock }]
+    })
+  }, [])
+
+  const removePerAppBudget = useCallback((exe: string) => {
+    setPerAppBudgets((prev) => prev.filter(p => p.exe !== exe))
+  }, [])
+
+  // Enforce per-app limits — runs in the same 5-second throttled check
+  const enforcePerAppLimits = useCallback(async () => {
+    if (perAppBudgets.length === 0) return
+
+    for (const proc of processes) {
+      const budget = perAppBudgets.find(
+        p => p.exe.toLowerCase() === proc.exe.toLowerCase() && p.limitMB > 0
+      )
+      if (!budget) continue
+
+      const exceeded = proc.sessionData >= budget.limitMB
+      const alreadyBlocked = perAppBlockedExesRef.current.includes(proc.exe)
+
+      if (exceeded && budget.autoBlock && !alreadyBlocked) {
+        try {
+          await blockApp(proc.exe)
+          perAppBlockedExesRef.current.push(proc.exe)
+          toast.warning(`App data limit exceeded`, {
+            description: `${proc.name} (${proc.exe}) used ${proc.sessionData.toFixed(0)} MB — limit is ${budget.limitMB} MB. Auto-blocked.`,
+            duration: 5000,
+          })
+        } catch {
+          // Skip
+        }
+      } else if (!exceeded && alreadyBlocked) {
+        // Usage went back below limit (e.g. after reset) — unblock
+        try {
+          await unblockApp(proc.exe)
+          perAppBlockedExesRef.current = perAppBlockedExesRef.current.filter(e => e !== proc.exe)
+        } catch {
+          // Skip
+        }
+      }
+    }
+  }, [processes, perAppBudgets, blockApp, unblockApp])
+
+  // ── Data Budget history (timeline snapshots) ───────────────────────────
+  const [budgetHistory, setBudgetHistory] = useState<DataBudgetSnapshot[]>(() => {
+    try {
+      const saved = localStorage.getItem("budget_history")
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+
+  // Record a budget snapshot every 60 seconds when processes have data
+  const lastBudgetSnapshotRef = useRef(0)
+  useEffect(() => {
+    const totalMB = processes.reduce((sum, p) => sum + p.sessionData, 0)
+    if (totalMB <= 0) return
+
+    const now = Date.now()
+    if (now - lastBudgetSnapshotRef.current < 60000) return // min 60s between snapshots
+    lastBudgetSnapshotRef.current = now
+
+    const snapshot: DataBudgetSnapshot = {
+      timestamp: new Date().toISOString(),
+      usageMB: Math.round(totalMB * 10) / 10,
+    }
+    setBudgetHistory((prev) => {
+      const updated = [...prev, snapshot].slice(-288) // keep last ~12 hours (288 × 60s)
+      localStorage.setItem("budget_history", JSON.stringify(updated))
+      return updated
+    })
+  }, [processes])
+
+  const clearBudgetHistory = useCallback(() => {
+    setBudgetHistory([])
+    localStorage.removeItem("budget_history")
+  }, [])
+
+  const resetDataBudget = useCallback(async () => {
+    setDailyUsedMB(0)
+    setWeeklyUsedMB(0)
+    setMonthlyUsedMB(0)
+    setThresholdsHitToday([])
+    localStorage.removeItem("budget_daily_used")
+    localStorage.removeItem("budget_daily_date")
+    localStorage.removeItem("budget_weekly_used")
+    localStorage.removeItem("budget_weekly_key")
+    localStorage.removeItem("budget_monthly_used")
+    localStorage.removeItem("budget_monthly_key")
+    localStorage.removeItem("budget_thresholds_hit")
+    await unblockBudgetBlockedApps()
+    // Unblock per-app blocked apps
+    for (const exe of perAppBlockedExesRef.current) {
+      try { await unblockApp(exe) } catch {}
+    }
+    perAppBlockedExesRef.current = []
+  }, [unblockBudgetBlockedApps, unblockApp])
 
   // ── Privacy Sentinel state ──────────────────────────────────────────────
   const DEFAULT_KNOWN_TRACKERS: KnownTracker[] = [
@@ -606,79 +1141,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         setRules(previous)
         console.error(`Failed to toggle rule "${id}":`, err)
         throw err
-      }
-    },
-    [rules]
-  )
-
-  const refreshProcesses = useCallback(async () => {
-    try {
-      const liveData: ProcessEntry[] = await invoke("get_live_processes")
-      setProcesses(liveData)
-      const totalSessionData = liveData.reduce((sum, p) => sum + p.sessionData, 0)
-      setDataBudgetUsed(Math.round(totalSessionData))
-    } catch (err) {
-      console.error("Failed to fetch live processes:", err)
-    }
-  }, [])
-
-  const refreshWfpStatus = useCallback(async () => {
-    try {
-      const available = await invoke<boolean>("get_wfp_status")
-      setWfpAvailable(available)
-      setFirewallStatus(available ? "active" : "inactive")
-    } catch (err) {
-      console.error("Failed to fetch WFP status:", err)
-      setWfpAvailable(false)
-      setFirewallStatus("inactive")
-    }
-  }, [])
-
-  const blockApp = useCallback(async (exePath: string) => {
-    try {
-      await invoke("toggle_process_shield", { exePath, block: true })
-      await refreshProcesses()
-    } catch (err) {
-      console.error("Failed to block app:", err)
-      throw err
-    }
-  }, [refreshProcesses])
-
-  const unblockApp = useCallback(async (exePath: string) => {
-    try {
-      await invoke("toggle_process_shield", { exePath, block: false })
-      await refreshProcesses()
-    } catch (err) {
-      console.error("Failed to unblock app:", err)
-      throw err
-    }
-  }, [refreshProcesses])
-
-  const refreshSuspendedPids = useCallback(async () => {
-    try {
-      const pids: number[] = await invoke("get_suspended_pids")
-      setSuspendedPids(new Set(pids))
-    } catch {
-      // ignore
-    }
-  }, [])
-
-  const suspendProcess = useCallback(async (pid: number) => {
-    const count: number = await invoke("suspend_process", { pid })
-    await refreshSuspendedPids()
-    return count
-  }, [])
-
-  const resumeProcess = useCallback(async (pid: number) => {
-    const count: number = await invoke("resume_process", { pid })
-    await refreshSuspendedPids()
-    return count
-  }, [])
-
-  const killProcess = useCallback(async (pid: number) => {
-    await invoke("kill_process", { pid })
-    await refreshProcesses()
-  }, [refreshProcesses])
+      }  }, [rules])
 
   const deleteRule = useCallback(
     async (id: string) => {
@@ -740,6 +1203,19 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         toggleShield,
         dataBudgetUsed,
         dataBudgetTotal,
+        budgetSettings,
+        dailyUsedMB,
+        weeklyUsedMB,
+        monthlyUsedMB,
+        thresholdsHitToday,
+        budgetHistory,
+        clearBudgetHistory,
+        perAppBudgets,
+        setPerAppBudget,
+        removePerAppBudget,
+        updateBudgetSettings,
+        resetDataBudget,
+        getBudgetStatus,
         lastHotspotDetected,
         firewallStatus,
         wfpAvailable,

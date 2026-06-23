@@ -4,7 +4,7 @@
 //! the appropriate engine method, and return a JSON-serialisable result.
 
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::State;
 
 #[cfg(target_os = "windows")]
 use crate::procctl;
