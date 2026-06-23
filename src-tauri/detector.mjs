@@ -81,6 +81,7 @@ const MULTI_PURPOSE = [
 
 function classifyNode(name, cmd) {
   const lower = cmd.toLowerCase();
+
   // Check for pnpm
   if (lower.includes('pnpm')) {
     if (lower.includes('install') || lower.includes(' add ') || lower.includes(' i ')) {
@@ -105,7 +106,8 @@ function classifyNode(name, cmd) {
   }
   // Check for npm
   if (lower.includes('npm')) {
-    if (lower.includes('install') || lower.includes(' i ') || lower.includes(' add ') || lower.includes('ci') || lower.includes('-cli')) {
+    // Removed -cli as it causes false positives for all npm commands run via node
+    if (lower.includes('install') || lower.includes(' i ') || lower.includes(' add ') || lower.includes('ci')) {
       return 'npm install';
     }
     return null;
@@ -193,6 +195,14 @@ function detectOperation(proc) {
 
   // Skip if already seen
   if (seen.has(dedupKey)) return null;
+
+  const lowerCmd = cmd.toLowerCase();
+  // Exclude common execution commands that aren't installs (global check)
+  if (lowerCmd.includes(' run ') || lowerCmd.includes(' exec ') ||
+      lowerCmd.includes(' start ') || lowerCmd.includes(' test ') ||
+      lowerCmd.includes(' dev ') || lowerCmd.includes(' serve ')) {
+    return null;
+  }
 
   // Phase 1: Single-purpose exe-name match
   const singleType = SINGLE_PURPOSE[exe];

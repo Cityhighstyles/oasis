@@ -1108,6 +1108,13 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
         return Some(cmd_type);
     }
 
+    // Exclude common execution commands that aren't installs (global check)
+    if lower_cmd.contains(" run ") || lower_cmd.contains(" exec ") ||
+       lower_cmd.contains(" start ") || lower_cmd.contains(" test ") ||
+       lower_cmd.contains(" dev ") || lower_cmd.contains(" serve ") {
+        return None;
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Phase 2: Cmdline-enriched match — for multi-purpose tools that need
     // the command line to distinguish sub-operations (install vs build vs
@@ -1124,6 +1131,7 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
             // return None for node.exe (too many false positives).
             return None;
         }
+
         // Cmdline available — check for known node-based tools
         if has_arg("pnpm") {
             if has_arg("install") || has_arg("add ") || has_arg("i ") { Some(CommandType::PnpmInstall) }
@@ -1135,7 +1143,8 @@ fn classify_process_cmdline(exe_name: &str, _exe_path: &str, cmdline: &str) -> O
             Some(CommandType::NpxRun)
         } else if has_arg("npm") {
             // npm can appear as "npm-cli.js", "npm.js", or "npm install"
-            if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci") || has_arg("-cli")
+            // Removed -cli as it causes false positives for all npm commands run via node
+            if has_arg("install") || has_arg("i ") || has_arg("add ") || has_arg("ci")
             {
                 Some(CommandType::NpmInstall)
             } else {
