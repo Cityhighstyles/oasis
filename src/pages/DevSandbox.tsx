@@ -18,7 +18,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronRight,
-  ExternalLink,
   Trash2,
   Scan,
   Loader2,
@@ -122,7 +121,6 @@ export function DevSandbox() {
   // Groq API key is loaded from .env file at startup — no manual input needed
   const [isScanning, setIsScanning] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
-  const [overlayWindows, setOverlayWindows] = useState<Set<string>>(new Set())
   const [autoScroll, setAutoScroll] = useState(true)
 
   const logRef = useRef<HTMLDivElement>(null)
@@ -338,19 +336,6 @@ export function DevSandbox() {
       toast.error("Failed to clear operations", { description: msg })
     }
   }, [])
-
-  const openOverlay = useCallback(async (opId: string) => {
-    try {
-      await invoke("create_sandbox_overlay", { operationId: opId })
-      setOverlayWindows((prev) => new Set(prev).add(opId))
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.error("Failed to open overlay:", err)
-      toast.error("Failed to open overlay", { description: msg })
-    }
-  }, [])
-
-
 
   const ringColor = timeLeft > 300 ? "#10b981" : timeLeft > 60 ? "#f59e0b" : "#ef4444"
 
@@ -687,7 +672,6 @@ export function DevSandbox() {
               operations.map((op) => {
                 const Icon = ICON_MAP[op.commandType.icon] || Terminal
                 const isEstimated = op.status === "estimated"
-                const isOverlayOpen = overlayWindows.has(op.id)
                 const hasPackage = op.packageName && op.packageName.length > 0
                 const hasWorkingDir = op.workingDir && op.workingDir.length > 0
 
@@ -829,19 +813,6 @@ export function DevSandbox() {
                         </div>
                       )}
 
-                      {/* Action buttons */}
-                      <div className="ml-12 flex items-center gap-2 pt-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-6 text-[9px] gap-1 hover:bg-neon-emerald/10 hover:text-neon-emerald"
-                          onClick={() => openOverlay(op.id)}
-                          disabled={isOverlayOpen}
-                        >
-                          <ExternalLink className="size-3" />
-                          {isOverlayOpen ? "Overlay Open" : "Open Overlay"}
-                        </Button>
-                      </div>
                     </div>
                   </div>
                 )
