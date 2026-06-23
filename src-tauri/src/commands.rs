@@ -8,6 +8,7 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(target_os = "windows")]
 use crate::procctl;
+use crate::carbon::CarbonStats;
 use crate::engine::{NetworkEngine, ProcessEntry};
 use crate::rules::Rule;
 use crate::sandbox::{CommandType, DetectedOperation, SandboxEngine};
@@ -269,6 +270,35 @@ pub fn clear_sandbox_operations(
     engine.clear_operations();
     Ok(())
 }
+
+// ═══════════════════════════ Carbon Commands ═══════════════════════════════
+
+/// Returns the current carbon statistics (cumulative CO₂ saved/footprint).
+#[tauri::command]
+pub fn get_carbon_stats(
+    state: State<'_, AppState>,
+) -> Result<CarbonStats, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    Ok(engine.get_carbon_stats())
+}
+
+/// Reset the carbon tracker (zero out all counters).
+#[tauri::command]
+pub fn reset_carbon_tracker(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.reset_carbon_tracker();
+    Ok(())
+}
+
+// ═══════════════════════════ Sandbox Commands ═══════════════════════════════
 
 /// Request a local size estimate for a specific operation type.
 /// Used when Groq is not configured.

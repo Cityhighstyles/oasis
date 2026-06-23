@@ -19,6 +19,7 @@ pub mod iphelper;
 #[cfg(target_os = "windows")]
 pub mod procctl;
 
+pub mod carbon;
 pub mod engine;
 pub mod commands;
 pub mod rules;
@@ -92,6 +93,9 @@ pub fn run() {
             commands::get_sandbox_status,
             commands::start_sandbox_scanner,
             commands::stop_sandbox_scanner,
+            // ── Carbon commands ────────────────────────────────────────────
+            commands::get_carbon_stats,
+            commands::reset_carbon_tracker,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

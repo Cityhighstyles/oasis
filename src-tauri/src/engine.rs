@@ -21,6 +21,7 @@ use std::time::Duration;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
+use crate::carbon::{CarbonTracker, CarbonStats};
 use crate::rules::RulesManager;
 
 #[cfg(target_os = "windows")]
@@ -128,6 +129,8 @@ pub struct NetworkEngine {
     /// Set of PIDs that have been suspended by the user.
     #[cfg(target_os = "windows")]
     pub suspended_pids: std::collections::HashSet<u32>,
+    /// Tracks cumulative carbon impact of network activity.
+    pub carbon_tracker: CarbonTracker,
 }
 
 impl NetworkEngine {
@@ -144,6 +147,7 @@ impl NetworkEngine {
             last_io_other_bytes: HashMap::new(),
             #[cfg(target_os = "windows")]
             suspended_pids: std::collections::HashSet::new(),
+            carbon_tracker: CarbonTracker::new(),
         }
     }
 
@@ -214,6 +218,16 @@ impl NetworkEngine {
     /// Clone the current process entry snapshot for the Tauri command handler.
     pub fn get_entries(&self) -> Vec<ProcessEntry> {
         self.entries.clone()
+    }
+
+    /// Return a snapshot of current carbon statistics.
+    pub fn get_carbon_stats(&self) -> CarbonStats {
+        self.carbon_tracker.get_stats()
+    }
+
+    /// Reset the carbon tracker (e.g. on user request).
+    pub fn reset_carbon_tracker(&mut self) {
+        self.carbon_tracker.reset();
     }
 
     /// Perform one full telemetry poll and update `self.entries`.
@@ -331,6 +345,15 @@ impl NetworkEngine {
             } else {
                 "monitoring"
             };
+
+            // Track carbon: record the bytes transferred this tick
+            let delta_bytes = net_stats.bytes_in;
+            self.carbon_tracker.record_bytes(
+                &net_stats.exe_path,
+                &display_name,
+                delta_bytes,
+                is_blocked,
+            );
 
             new_entries.push(ProcessEntry {
                 pid: *pid,

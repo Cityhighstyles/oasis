@@ -24,6 +24,8 @@ import {
   Info,
   Lock,
   PlayCircle,
+  Leaf,
+  Sprout,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -770,6 +772,24 @@ export function DevSandbox() {
                           )}
                         </div>
                       </div>
+
+                      {/* Carbon estimate */}
+                      {isEstimated && op.estimatedMb > 0 && (
+                        <div className="ml-12 flex items-center gap-3 mb-2">
+                          <div className="flex items-center gap-1.5 rounded-full border border-neon-emerald/20 bg-neon-emerald/5 px-2.5 py-1">
+                            <Leaf className="size-3 text-neon-emerald" />
+                            <span className="text-[9px] text-neon-emerald font-medium">
+                              ~{(op.estimatedMb * 0.03).toFixed(2)}g CO₂
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5 text-[8px] text-muted-foreground/60">
+                            <Sprout className="size-2.5" />
+                            <span>
+                              ≈{((op.estimatedMb * 0.03) / 21000).toFixed(5)} trees/year
+                            </span>
+                          </div>
+                        </div>
+                      )}
 
                       {/* Download estimate */}
                       {isEstimated && op.estimatedMb > 0 && (

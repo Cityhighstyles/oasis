@@ -11,6 +11,13 @@ import {
   FlaskConical,
   Crown,
   ArrowUpDown,
+  Brain,
+  ShieldAlert,
+  Leaf,
+  Trees,
+  Sprout,
+  Droplets,
+  RotateCcw,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -81,6 +88,56 @@ function DataBudgetRing({
 }
 
 /// Format bytes/sec to a human-readable string (e.g. "1.2 MB/s", "420 KB/s").
+/// Circular carbon savings gauge — shows a glowing ring proportional to CO₂ saved.
+function CarbonRing({ grams }: { grams: number }) {
+  // Max visual reference: 100g CO₂ fills the ring
+  const maxRef = Math.max(grams, 100)
+  const pct = Math.min((grams / maxRef) * 100, 100)
+  const radius = 36
+  const circumference = 2 * Math.PI * radius
+  const strokeDashoffset = circumference - (pct / 100) * circumference
+
+  const color = grams > 50
+    ? "oklch(0.72 0.19 165)"  // emerald for high savings
+    : grams > 10
+      ? "oklch(0.75 0.16 80)"   // amber for moderate
+      : "oklch(0.63 0.22 25)"   // warmer tone for low
+
+  return (
+    <svg width="100" height="100" className="-rotate-90">
+      <circle
+        cx="50" cy="50" r={radius}
+        fill="none"
+        stroke="oklch(0.2 0.012 264)"
+        strokeWidth="8"
+      />
+      <circle
+        cx="50" cy="50" r={radius}
+        fill="none"
+        stroke={color}
+        strokeWidth="8"
+        strokeLinecap="round"
+        strokeDasharray={circumference}
+        strokeDashoffset={strokeDashoffset}
+        style={{
+          filter: `drop-shadow(0 0 6px ${color})`,
+          transition: "stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)",
+        }}
+      />
+      <text
+        x="50" y="50"
+        textAnchor="middle"
+        dominantBaseline="middle"
+        fill="currentColor"
+        className="text-xs font-bold tabular-nums"
+        transform="rotate(90 50 50)"
+      >
+        {grams.toFixed(1)}g
+      </text>
+    </svg>
+  )
+}
+
 function formatSpeed(bytesPerSecond: number): string {
   if (bytesPerSecond >= 1024 * 1024) {
     return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
@@ -99,7 +156,7 @@ interface SandboxStatus {
 }
 
 export function Dashboard() {
-  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules } =
+  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, privacyAssessments, overallPrivacyScore } =
     useShield()
 
   const pct = Math.round((dataBudgetUsed / dataBudgetTotal) * 100)
@@ -358,6 +415,38 @@ export function Dashboard() {
               </CardContent>
             </Card>
 
+            {/* Focus Mode */}
+            <Card className={cn("border transition-all duration-300", isFocusMode ? "border-violet-500/20 bg-violet-500/5" : "border-border bg-card")}>
+              <CardContent className="flex items-center gap-3 py-3 px-4">
+                <Brain className={cn("size-5 shrink-0", isFocusMode ? "text-violet-400" : "text-muted-foreground/40")} />
+                <div className="min-w-0">
+                  <p className="text-[11px] text-muted-foreground truncate">Focus</p>
+                  <p className={cn("text-base font-bold tabular-nums", isFocusMode ? "text-violet-400" : "text-muted-foreground/60")}>
+                    {isFocusMode ? "Active" : "Inactive"}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60">
+                    {isFocusMode ? "In session" : `${todayFocusMinutes}m today`}
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Privacy Sentinel */}
+            <Card className="border-border bg-card">
+              <CardContent className="flex items-center gap-3 py-3 px-4">
+                <ShieldAlert className={cn("size-5 shrink-0", overallPrivacyScore <= 50 ? "text-rose-400" : "text-muted-foreground/40")} />
+                <div className="min-w-0">
+                  <p className="text-[11px] text-muted-foreground truncate">Privacy</p>
+                  <p className={cn("text-base font-bold tabular-nums", overallPrivacyScore <= 50 ? "text-rose-400" : "text-muted-foreground/60")}>
+                    {overallPrivacyScore}/100
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60">
+                    {privacyAssessments.filter(a => a.risk === "critical" || a.risk === "high").length} risky apps
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+
             {/* Sandbox Status */}
             <Card className="border-border bg-card">
               <CardContent className="flex items-center gap-3 py-3 px-4">
@@ -391,9 +480,146 @@ export function Dashboard() {
             </Card>
           </div>
         </div>
-      </div>
+      </div>          {/* ═══════════════════════════════════════════════════════════════ */}
+          {/* CLIMATE IMPACT SECTION */}
+          {/* ═══════════════════════════════════════════════════════════════ */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <Leaf className="size-4 text-neon-emerald" />
+              <h2 className="text-sm font-semibold tracking-tight text-foreground">
+                Climate Impact
+              </h2>
+              <Badge variant="outline" className="text-[9px] border-neon-emerald/20 text-neon-emerald bg-neon-emerald/5 ml-1">
+                AI-Powered
+              </Badge>
+            </div>
 
-      {/* Top Bandwidth Consumers */}
+            <div className="grid grid-cols-4 gap-4">
+              {/* Carbon Saved — ring gauge */}
+              <Card className="border-neon-emerald/20 bg-neon-emerald/5 col-span-1">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                    <Sprout className="size-3.5 text-neon-emerald" />
+                    CO₂ Saved
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col items-center gap-2">
+                  <CarbonRing grams={carbonStats.carbonSavedGrams} />
+                  <div className="text-center">
+                    <p className="text-lg font-bold text-neon-emerald tabular-nums">
+                      {carbonStats.carbonSavedGrams.toFixed(1)}g
+                    </p>
+                    <p className="text-[10px] text-muted-foreground">of CO₂ avoided</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 rounded-full border border-neon-emerald/20 bg-neon-emerald/10 px-2.5 py-1">
+                    <Trees className="size-3 text-neon-emerald" />
+                    <span className="text-[10px] font-medium text-neon-emerald tabular-nums">
+                      ≈ {carbonStats.treesEquivalent.toFixed(2)} trees/year
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* Carbon Footprint */}
+              <Card className="border-amber-500/20 bg-amber-500/5 col-span-1">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                    <Droplets className="size-3.5 text-amber-400" />
+                    Carbon Footprint
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col items-center gap-2 pt-2">
+                  <div className="flex size-20 items-center justify-center rounded-full border-2 border-amber-500/30 bg-amber-500/5">
+                    <span className="text-xl font-bold text-amber-400 tabular-nums">
+                      {carbonStats.carbonFootprintGrams.toFixed(1)}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-muted-foreground">grams CO₂ emitted</p>
+                  <Progress
+                    value={carbonStats.carbonFootprintGrams > 0
+                      ? Math.min(100, (carbonStats.carbonSavedGrams / Math.max(carbonStats.carbonFootprintGrams, 0.1)) * 100)
+                      : 0}
+                    className="h-1.5 w-full bg-amber-500/10"
+                  />
+                  <p className="text-[9px] text-muted-foreground/60">
+                    {carbonStats.carbonSavedGrams > 0
+                      ? `${Math.round((carbonStats.carbonSavedGrams / Math.max(carbonStats.carbonFootprintGrams + carbonStats.carbonSavedGrams, 0.1)) * 100)}% offset by blocking`
+                      : "No blocking activity yet"}
+                  </p>
+                </CardContent>
+              </Card>
+
+              {/* Top Carbon Savers */}
+              <Card className="border-border bg-card col-span-2">
+                <CardHeader className="pb-2 border-b border-border">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-xs font-medium text-foreground flex items-center gap-1.5">
+                      <Leaf className="size-3.5 text-neon-emerald" />
+                      Top Carbon Savers
+                    </CardTitle>
+                    <button
+                      onClick={resetCarbonTracker}
+                      className="flex items-center gap-1 text-[9px] text-muted-foreground/60 hover:text-foreground transition-colors"
+                    >
+                      <RotateCcw className="size-2.5" />
+                      Reset
+                    </button>
+                  </div>
+                </CardHeader>
+                <CardContent className="p-0">
+                  {carbonStats.processes.filter(p => p.savedGrams > 0).length > 0 ? (
+                    <div className="divide-y divide-border">
+                      <div className="grid grid-cols-[24px_1fr_80px_80px] gap-3 px-4 py-2 text-[9px] font-semibold uppercase tracking-widest text-muted-foreground/60 bg-muted/20">
+                        <span>#</span>
+                        <span>Application</span>
+                        <span className="text-right">Saved</span>
+                        <span className="text-right">Footprint</span>
+                      </div>
+                      {carbonStats.processes
+                        .filter(p => p.savedGrams > 0 || p.footprintGrams > 0)
+                        .sort((a, b) => (b.savedGrams + b.footprintGrams) - (a.savedGrams + a.footprintGrams))
+                        .slice(0, 5)
+                        .map((p, i) => (
+                          <div
+                            key={p.exe}
+                            className="grid grid-cols-[24px_1fr_80px_80px] gap-3 px-4 py-2 hover:bg-accent/20 transition-colors items-center"
+                          >
+                            <span className={cn(
+                              "text-xs font-bold tabular-nums text-center",
+                              i === 0 ? "text-neon-emerald" : i === 1 ? "text-muted-foreground/80" : "text-muted-foreground/40"
+                            )}>
+                              {i + 1}
+                            </span>
+                            <div className="min-w-0">
+                              <p className="text-xs font-medium text-foreground truncate">{p.name}</p>
+                              <p className="text-[9px] font-mono text-muted-foreground/50 truncate">{p.exe}</p>
+                            </div>
+                            <p className="text-xs tabular-nums font-medium text-right text-neon-emerald self-center">
+                              {p.savedGrams > 0 ? `${p.savedGrams.toFixed(2)}g` : "—"}
+                            </p>
+                            <p className="text-xs tabular-nums font-medium text-right text-amber-400/80 self-center">
+                              {p.footprintGrams > 0 ? `${p.footprintGrams.toFixed(2)}g` : "—"}
+                            </p>
+                          </div>
+                        ))}
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
+                      <div className="flex flex-col items-center gap-1">
+                        <Sprout className="size-6 text-muted-foreground/20" />
+                        <p className="text-xs">No carbon data yet</p>
+                        <p className="text-[9px] text-muted-foreground/50">
+                          Block network traffic to start saving CO₂
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+
+          {/* Top Bandwidth Consumers */}
       <Card className="border-border bg-card">
         <CardHeader className="pb-3 border-b border-border">
           <div className="flex items-center justify-between">

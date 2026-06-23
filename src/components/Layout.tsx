@@ -4,6 +4,9 @@ import {
   SlidersHorizontal,
   Activity,
   FlaskConical,
+  Brain,
+  ShieldAlert,
+  Globe,
   Shield,
   ShieldOff,
   Wifi,
@@ -17,6 +20,9 @@ import { cn } from "@/lib/utils"
 
 const NAV_ITEMS = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
+  { to: "/climate", icon: Globe, label: "Climate Impact" },
+  { to: "/focus", icon: Brain, label: "Digital Wellness" },
+  { to: "/privacy", icon: ShieldAlert, label: "Privacy Sentinel" },
   { to: "/rules", icon: SlidersHorizontal, label: "Rules & Controls" },
   { to: "/monitor", icon: Activity, label: "Live Monitor" },
   { to: "/sandbox", icon: FlaskConical, label: "Dev Sandbox" },
