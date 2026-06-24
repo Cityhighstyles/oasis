@@ -1,4 +1,4 @@
-  import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react"
+import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react"
 import { toast } from "sonner"
 import { invoke } from "@tauri-apps/api/core"
 
@@ -89,6 +89,8 @@ export interface DataBudgetSettings {
   onExceed: BudgetExceedAction
   /** Executable names that are essential and should never be auto-blocked */
   essentialApps: string[]
+  /** Custom absolute MB alert — fires once when usage reaches this level (0 = disabled) */
+  customAlertMB: number
 }
 
 export interface DataBudgetPerProcess {
@@ -152,6 +154,7 @@ const DEFAULT_BUDGET_SETTINGS: DataBudgetSettings = {
     "system",
     "idle",
   ],
+  customAlertMB: 0,
 }
 
 // ── Privacy Sentinel types ────────────────────────────────────────────────────
@@ -267,6 +270,10 @@ type ShieldContextType = {
   stopFocusSession: () => void
   toggleDistractingApp: (exe: string) => void
   resetFocusStats: () => void
+  focusSessions: FocusSession[]
+  addDistractingApp: (exe: string, name: string, category: string) => void
+  focusHistoryDays: { date: string; minutes: number }[]
+  clearFocusSessions: () => void
   // ── Privacy Sentinel ────────────────────────────────────────────────────
   knownTrackers: KnownTracker[]
   privacyAssessments: PrivacyAssessment[]
@@ -465,6 +472,23 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     catch { return 0 }
   })
   const [currentSessionDistractions, setCurrentSessionDistractions] = useState(0)
+
+  // ── Focus sessions history ─────────────────────────────────────────────
+  const [focusSessions, setFocusSessions] = useState<FocusSession[]>(() => {
+    try {
+      const saved = localStorage.getItem("focus_sessions")
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+
+  // ── Multi-day focus minutes history ─────────────────────────────────────
+  const [focusHistoryDays, setFocusHistoryDays] = useState<{ date: string; minutes: number }[]>(() => {
+    try {
+      const saved = localStorage.getItem("focus_history_days")
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+
   const focusTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const focusSessionStartRef = useRef<number>(0)
   const blockedAppsDuringFocus = useRef<string[]>([])
@@ -486,15 +510,47 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem("focus_streak", String(focusStreak))
   }, [focusStreak])
 
+  // ── Persist focus sessions ──────────────────────────────────────────
+  useEffect(() => {
+    localStorage.setItem("focus_sessions", JSON.stringify(focusSessions.slice(-50)))
+  }, [focusSessions])
+
+  useEffect(() => {
+    localStorage.setItem("focus_history_days", JSON.stringify(focusHistoryDays.slice(-90)))
+  }, [focusHistoryDays])
+
   // Helper to record session completion
   const recordFocusSession = useCallback((elapsedSeconds: number) => {
     const minutes = Math.round(elapsedSeconds / 60)
     if (minutes > 0) {
       setTodayFocusMinutes((prev) => prev + minutes)
+
+      // Update multi-day history
+      const today = new Date().toISOString().slice(0, 10)
+      setFocusHistoryDays((prev) => {
+        const existing = prev.find(d => d.date === today)
+        if (existing) {
+          return prev.map(d => d.date === today ? { ...d, minutes: d.minutes + minutes } : d)
+        }
+        return [...prev, { date: today, minutes }].slice(-90)
+      })
     }
-    // Update streak: if they completed a session, increment streak
+    // Update streak
     setFocusStreak((prev) => prev + 1)
   }, [])
+
+  // Create a focus session record
+  const createFocusSessionRecord = useCallback((elapsedSeconds: number, completed: boolean) => {
+    const session: FocusSession = {
+      id: `focus_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      startTime: focusSessionStartRef.current,
+      duration: focusDuration || Math.round(elapsedSeconds),
+      completedSeconds: elapsedSeconds,
+      completed,
+      distractionsBlocked: currentSessionDistractions,
+    }
+    setFocusSessions((prev) => [session, ...prev].slice(-50))
+  }, [focusDuration, currentSessionDistractions])
 
   const startFocusSession = useCallback(async (duration: number) => {
     setIsFocusMode(true)
@@ -538,6 +594,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
             sessionRecordedRef.current = true
             const elapsed = Math.floor((Date.now() - focusSessionStartRef.current) / 1000)
             recordFocusSession(elapsed)
+            createFocusSessionRecord(elapsed, true)
           }
 
           return 0
@@ -568,6 +625,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       const elapsed = Math.floor((Date.now() - focusSessionStartRef.current) / 1000)
       if (elapsed > 60) {
         recordFocusSession(elapsed)
+        createFocusSessionRecord(elapsed, false)
       }
     }
 
@@ -583,6 +641,20 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         app.exe === exe ? { ...app, enabled: !app.enabled } : app
       )
     )
+  }, [])
+
+  const addDistractingApp = useCallback((exe: string, name: string, category: string) => {
+    setDistractingApps((prev) => {
+      if (prev.some(a => a.exe.toLowerCase() === exe.toLowerCase())) return prev
+      return [...prev, { exe: exe.toLowerCase(), name, category, enabled: true }]
+    })
+  }, [])
+
+  const clearFocusSessions = useCallback(() => {
+    setFocusSessions([])
+    setFocusHistoryDays([])
+    localStorage.removeItem("focus_sessions")
+    localStorage.removeItem("focus_history_days")
   }, [])
 
   const resetFocusStats = useCallback(() => {
@@ -620,6 +692,15 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     } catch { return 0 }
   })
 
+    // ── Per-app budget limits ───────────────────────────────────────────────
+  const [perAppBudgets, setPerAppBudgets] = useState<PerAppBudget[]>(() => {
+    try {
+      const saved = localStorage.getItem("budget_per_app")
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+
+
   const [weeklyUsedMB, setWeeklyUsedMB] = useState(() => {
     try {
       const savedWeek = localStorage.getItem("budget_weekly_key")
@@ -627,10 +708,11 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       const startOfYear = new Date(now.getFullYear(), 0, 1)
       const days = Math.floor((now.getTime() - startOfYear.getTime()) / 86400000)
       const week = Math.ceil((days + startOfYear.getDay() + 1) / 7)
+      // With this:
       const currentWeek = `${now.getFullYear()}-W${String(week).padStart(2, "0")}`
       if (savedWeek !== currentWeek) {
         localStorage.removeItem("budget_weekly_used")
-        localStorage.setItem("budget_weekly_key", computedWeek)
+        localStorage.setItem("budget_weekly_key", currentWeek) // Fixed
         return 0
       }
       return Number(localStorage.getItem("budget_weekly_used")) || 0
@@ -661,10 +743,90 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   // Track which non-essential apps have been auto-blocked due to budget
   const budgetBlockedAppsRef = useRef<string[]>([])
 
+  // Track whether the custom alert has been fired today (value stored prevents re-fire on same value)
+  const customAlertFiredRef = useRef<number>(0)
+
   // Helper to persist daily/monthly usage
   const persistUsage = useCallback(() => {
     // Daily is saved via effect, but we also sync on refresh
   }, [])
+
+  const enforceBudgetBlock = useCallback(async (currentMB: number) => {
+    const exceeded = currentMB >= budgetSettings.dailyLimitMB
+    if (!exceeded) {
+      // Unblock if we previously blocked
+      await unblockBudgetBlockedApps()
+      return
+    }
+
+    if (budgetSettings.onExceed === "block_all") {
+      // Block ALL processes — hard network stop
+      for (const app of processes) {
+        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
+          try {
+            await blockApp(app.exe)
+            budgetBlockedAppsRef.current.push(app.exe)
+          } catch {
+            // Skip
+          }
+        }
+      }
+    } else if (budgetSettings.onExceed === "block_non_essential") {
+      // Block only non-essential apps (skip those in the essential list)
+      const appsToBlock = processes.filter(
+        p => !budgetSettings.essentialApps.some(e => p.exe.toLowerCase().includes(e.toLowerCase()))
+      )
+      for (const app of appsToBlock) {
+        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
+          try {
+            await blockApp(app.exe)
+            budgetBlockedAppsRef.current.push(app.exe)
+          } catch {
+            // Skip
+          }
+        }
+      }
+    }
+  }, [processes, budgetSettings, blockApp])
+
+
+    // Enforce per-app limits — runs in the same 5-second throttled check
+  const enforcePerAppLimits = useCallback(async () => {
+    if (perAppBudgets.length === 0) return
+
+    for (const proc of processes) {
+      const budget = perAppBudgets.find(
+        p => p.exe.toLowerCase() === proc.exe.toLowerCase() && p.limitMB > 0
+      )
+      if (!budget) continue
+
+      const exceeded = proc.sessionData >= budget.limitMB
+      const alreadyBlocked = perAppBlockedExesRef.current.includes(proc.exe)
+
+      if (exceeded && budget.autoBlock && !alreadyBlocked) {
+        try {
+          await blockApp(proc.exe)
+          perAppBlockedExesRef.current.push(proc.exe)
+          toast.warning(`App data limit exceeded`, {
+            description: `${proc.name} (${proc.exe}) used ${proc.sessionData.toFixed(0)} MB — limit is ${budget.limitMB} MB. Auto-blocked.`,
+            duration: 5000,
+          })
+        } catch {
+          // Skip
+        }
+      } else if (!exceeded && alreadyBlocked) {
+        // Usage went back below limit (e.g. after reset) — unblock
+        try {
+          await unblockApp(proc.exe)
+          perAppBlockedExesRef.current = perAppBlockedExesRef.current.filter(e => e !== proc.exe)
+        } catch {
+          // Skip
+        }
+      }
+    }
+  }, [processes, perAppBudgets, blockApp, unblockApp])
+
+
 
   useEffect(() => {
     localStorage.setItem("budget_daily_used", String(dailyUsedMB))
@@ -748,6 +910,20 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    // ── Custom absolute MB alert ─────────────────────────────────────
+    const customAlert = budgetSettings.customAlertMB
+    if (customAlert > 0 && totalMB >= customAlert && customAlertFiredRef.current !== customAlert) {
+      customAlertFiredRef.current = customAlert
+      toast.warning(`Data Budget: ${totalMB.toFixed(0)} MB used`, {
+        description: `Custom alert: usage reached ${customAlert} MB (set in budget settings).`,
+        duration: 6000,
+      })
+    }
+    // Reset if usage drops below the alert level (e.g. after reset)
+    if (customAlert > 0 && totalMB < customAlert && customAlertFiredRef.current === customAlert) {
+      customAlertFiredRef.current = 0
+    }
+
     // Collapse newlyHit from the new thresholdSources
     const newlyHit = thresholdSources.map(s => s.threshold)
 
@@ -768,44 +944,6 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       unblockBudgetBlockedApps()
     }
   }, [processes, budgetSettings, thresholdsHitToday, enforceBudgetBlock, enforcePerAppLimits])
-
-  const enforceBudgetBlock = useCallback(async (currentMB: number) => {
-    const exceeded = currentMB >= budgetSettings.dailyLimitMB
-    if (!exceeded) {
-      // Unblock if we previously blocked
-      await unblockBudgetBlockedApps()
-      return
-    }
-
-    if (budgetSettings.onExceed === "block_all") {
-      // Block ALL processes — hard network stop
-      for (const app of processes) {
-        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
-          try {
-            await blockApp(app.exe)
-            budgetBlockedAppsRef.current.push(app.exe)
-          } catch {
-            // Skip
-          }
-        }
-      }
-    } else if (budgetSettings.onExceed === "block_non_essential") {
-      // Block only non-essential apps (skip those in the essential list)
-      const appsToBlock = processes.filter(
-        p => !budgetSettings.essentialApps.some(e => p.exe.toLowerCase().includes(e.toLowerCase()))
-      )
-      for (const app of appsToBlock) {
-        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
-          try {
-            await blockApp(app.exe)
-            budgetBlockedAppsRef.current.push(app.exe)
-          } catch {
-            // Skip
-          }
-        }
-      }
-    }
-  }, [processes, budgetSettings, blockApp])
 
   const unblockBudgetBlockedApps = useCallback(async () => {
     for (const exe of budgetBlockedAppsRef.current) {
@@ -842,13 +980,6 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     }
   }, [processes, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, budgetSettings, thresholdsHitToday])
 
-  // ── Per-app budget limits ───────────────────────────────────────────────
-  const [perAppBudgets, setPerAppBudgets] = useState<PerAppBudget[]>(() => {
-    try {
-      const saved = localStorage.getItem("budget_per_app")
-      return saved ? JSON.parse(saved) : []
-    } catch { return [] }
-  })
 
   // Persist per-app budgets
   useEffect(() => {
@@ -873,42 +1004,6 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   const removePerAppBudget = useCallback((exe: string) => {
     setPerAppBudgets((prev) => prev.filter(p => p.exe !== exe))
   }, [])
-
-  // Enforce per-app limits — runs in the same 5-second throttled check
-  const enforcePerAppLimits = useCallback(async () => {
-    if (perAppBudgets.length === 0) return
-
-    for (const proc of processes) {
-      const budget = perAppBudgets.find(
-        p => p.exe.toLowerCase() === proc.exe.toLowerCase() && p.limitMB > 0
-      )
-      if (!budget) continue
-
-      const exceeded = proc.sessionData >= budget.limitMB
-      const alreadyBlocked = perAppBlockedExesRef.current.includes(proc.exe)
-
-      if (exceeded && budget.autoBlock && !alreadyBlocked) {
-        try {
-          await blockApp(proc.exe)
-          perAppBlockedExesRef.current.push(proc.exe)
-          toast.warning(`App data limit exceeded`, {
-            description: `${proc.name} (${proc.exe}) used ${proc.sessionData.toFixed(0)} MB — limit is ${budget.limitMB} MB. Auto-blocked.`,
-            duration: 5000,
-          })
-        } catch {
-          // Skip
-        }
-      } else if (!exceeded && alreadyBlocked) {
-        // Usage went back below limit (e.g. after reset) — unblock
-        try {
-          await unblockApp(proc.exe)
-          perAppBlockedExesRef.current = perAppBlockedExesRef.current.filter(e => e !== proc.exe)
-        } catch {
-          // Skip
-        }
-      }
-    }
-  }, [processes, perAppBudgets, blockApp, unblockApp])
 
   // ── Data Budget history (timeline snapshots) ───────────────────────────
   const [budgetHistory, setBudgetHistory] = useState<DataBudgetSnapshot[]>(() => {
@@ -959,7 +1054,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     await unblockBudgetBlockedApps()
     // Unblock per-app blocked apps
     for (const exe of perAppBlockedExesRef.current) {
-      try { await unblockApp(exe) } catch {}
+      try { await unblockApp(exe) } catch { }
     }
     perAppBlockedExesRef.current = []
   }, [unblockBudgetBlockedApps, unblockApp])
@@ -1052,10 +1147,10 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
 
       const risk: PrivacyRisk =
         score <= 30 ? "critical" :
-        score <= 50 ? "high" :
-        score <= 70 ? "medium" :
-        score <= 85 ? "low" :
-        "safe"
+          score <= 50 ? "high" :
+            score <= 70 ? "medium" :
+              score <= 85 ? "low" :
+                "safe"
 
       return {
         exe: proc.exe,
@@ -1085,7 +1180,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
           // Check if we already have an entry for this app recently
           const recent = prev.some(
             e => e.appExe === a.exe && e.risk === a.risk &&
-                 e.timestamp.startsWith(now.slice(0, 2)) // same hour
+              e.timestamp.startsWith(now.slice(0, 2)) // same hour
           )
           if (!recent) {
             newEntries.push({
@@ -1141,7 +1236,8 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         setRules(previous)
         console.error(`Failed to toggle rule "${id}":`, err)
         throw err
-      }  }, [rules])
+      }
+    }, [rules])
 
   const deleteRule = useCallback(
     async (id: string) => {
@@ -1250,6 +1346,10 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         stopFocusSession,
         toggleDistractingApp,
         resetFocusStats,
+        focusSessions,
+        addDistractingApp,
+        focusHistoryDays,
+        clearFocusSessions,
         knownTrackers,
         privacyAssessments,
         privacyAuditLog,

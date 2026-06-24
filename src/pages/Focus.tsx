@@ -20,6 +20,10 @@ import {
   Zap,
   Trophy,
   BarChart3,
+  Plus,
+  Trash2,
+  History,
+  ListChecks,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -76,11 +80,28 @@ export function Focus() {
     stopFocusSession,
     toggleDistractingApp,
     resetFocusStats,
+    focusSessions,
+    addDistractingApp,
+    focusHistoryDays,
+    clearFocusSessions,
   } = useShield()
 
   const [selectedDuration, setSelectedDuration] = useState(DURATIONS[1]) // default 30 min
   const [categoryFilter, setCategoryFilter] = useState("all")
   const [searchQuery, setSearchQuery] = useState("")
+  const [newAppExe, setNewAppExe] = useState("")
+  const [newAppName, setNewAppName] = useState("")
+  const [newAppCategory, setNewAppCategory] = useState("social")
+
+  const handleAddCustomApp = () => {
+    const exe = newAppExe.trim()
+    const name = newAppName.trim() || exe.replace(/\.exe$/i, "")
+    if (exe) {
+      addDistractingApp(exe, name, newAppCategory)
+      setNewAppExe("")
+      setNewAppName("")
+    }
+  }
 
   // ── Computed values ────────────────────────────────────────────────────
 
@@ -338,6 +359,47 @@ export function Focus() {
                 </div>
               </div>
 
+              {/* Add custom app */}
+              <div className="flex items-center gap-2 mt-2 pt-2 border-t border-border/40">
+                <Input
+                  placeholder="exe name (e.g. figma.exe)"
+                  value={newAppExe}
+                  onChange={(e) => setNewAppExe(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleAddCustomApp() }}
+                  className="h-7 text-[10px] font-mono flex-1 bg-background/50 border-border"
+                  disabled={isFocusMode}
+                />
+                <Input
+                  placeholder="Display name (optional)"
+                  value={newAppName}
+                  onChange={(e) => setNewAppName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleAddCustomApp() }}
+                  className="h-7 text-[10px] w-36 bg-background/50 border-border"
+                  disabled={isFocusMode}
+                />
+                <select
+                  value={newAppCategory}
+                  onChange={(e) => setNewAppCategory(e.target.value)}
+                  className="h-7 text-[10px] bg-background/50 border border-border rounded-md px-2 text-muted-foreground"
+                  disabled={isFocusMode}
+                >
+                  <option value="social">Social</option>
+                  <option value="communication">Communication</option>
+                  <option value="gaming">Gaming</option>
+                  <option value="entertainment">Entertainment</option>
+                </select>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1 text-[10px] text-violet-400 hover:text-violet-300 hover:bg-violet-500/10"
+                  onClick={handleAddCustomApp}
+                  disabled={isFocusMode || !newAppExe.trim()}
+                >
+                  <Plus className="size-3" />
+                  Add
+                </Button>
+              </div>
+
               {/* Category filter tabs */}
               <div className="flex items-center gap-1 mt-2 pt-2 border-t border-border/40">
                 {CATEGORIES.map(({ key, label }) => (
@@ -434,11 +496,80 @@ export function Focus() {
             </CardContent>
           </Card>
 
+          {/* Focus Trends */}
+          <Card className="border-border bg-card">
+            <CardHeader className="border-b border-border py-3 px-5">
+              <div className="flex items-center gap-2">
+                <BarChart3 className="size-4 text-neon-cyan" />
+                <CardTitle className="text-sm font-medium text-foreground">
+                  Focus Trends
+                </CardTitle>
+                <Badge variant="outline" className="text-[9px] border-border text-muted-foreground">
+                  {focusHistoryDays.length} days
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="p-4">
+              {focusHistoryDays.length > 0 ? (
+                <div className="space-y-2">
+                  {/* Mini bar chart - last 14 days */}
+                  <div className="flex items-end gap-1 h-20">
+                    {(() => {
+                      const days = focusHistoryDays.slice(-14)
+                      const maxMin = Math.max(1, ...days.map(d => d.minutes))
+                      return days.map((day) => {
+                        const pct = (day.minutes / maxMin) * 100
+                        const isToday = day.date === new Date().toISOString().slice(0, 10)
+                        return (
+                          <div
+                            key={day.date}
+                            className="flex-1 flex flex-col items-center gap-0.5 group relative"
+                          >
+                            <div
+                              className={cn(
+                                "w-full rounded-sm transition-all duration-300",
+                                isToday ? "bg-violet-400" : "bg-violet-500/40 hover:bg-violet-500/60"
+                              )}
+                              style={{ height: `${Math.max(pct, 2)}%` }}
+                            />
+                            <span className={cn(
+                              "text-[7px] font-mono",
+                              isToday ? "text-violet-400" : "text-muted-foreground/40"
+                            )}>
+                              {new Date(day.date).toLocaleDateString(undefined, { weekday: "narrow" })}
+                            </span>
+                            {/* Tooltip on hover */}
+                            <div className="absolute bottom-full mb-1 hidden group-hover:flex flex-col items-center">
+                              <span className="text-[9px] bg-popover border border-border rounded px-1.5 py-0.5 whitespace-nowrap">
+                                {new Date(day.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                                : {day.minutes}m
+                              </span>
+                            </div>
+                          </div>
+                        )
+                      })
+                    })()}
+                  </div>
+                  <div className="flex items-center justify-between text-[9px] text-muted-foreground/60">
+                    <span>Last {Math.min(focusHistoryDays.length, 14)} days</span>
+                    <span>
+                      Avg: {Math.round(focusHistoryDays.slice(-14).reduce((s, d) => s + d.minutes, 0) / Math.max(focusHistoryDays.slice(-14).length, 1))}m / day
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center py-4 text-[11px] text-muted-foreground/60">
+                  No trend data yet — complete a focus session to start tracking
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           {/* Session Insights */}
           <Card className="border-border bg-card">
             <CardHeader className="border-b border-border py-3 px-5">
               <div className="flex items-center gap-2">
-                <BarChart3 className="size-4 text-muted-foreground" />
+                <Hourglass className="size-4 text-violet-400" />
                 <CardTitle className="text-sm font-medium text-foreground">
                   Focus Insights
                 </CardTitle>
@@ -490,6 +621,102 @@ export function Focus() {
                   <p className="text-xs">No focus data yet</p>
                   <p className="text-[10px] text-muted-foreground/50 mt-1">
                     Start a focus session to see your productivity insights
+                  </p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Session History */}
+          <Card className="border-border bg-card">
+            <CardHeader className="border-b border-border py-3 px-5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <History className="size-4 text-violet-400" />
+                  <CardTitle className="text-sm font-medium text-foreground">
+                    Session History
+                  </CardTitle>
+                  <Badge variant="outline" className="text-[9px] border-border text-muted-foreground">
+                    {focusSessions.length} sessions
+                  </Badge>
+                </div>
+                {focusSessions.length > 0 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 gap-1 text-[9px] text-muted-foreground/50 hover:text-destructive"
+                    onClick={clearFocusSessions}
+                  >
+                    <Trash2 className="size-3" />
+                    Clear
+                  </Button>
+                )}
+              </div>
+            </CardHeader>
+            <CardContent className="p-0">
+              {focusSessions.length > 0 ? (
+                <div className="divide-y divide-border max-h-64 overflow-y-auto">
+                  {focusSessions.map((session) => {
+                    const startDate = new Date(session.startTime)
+                    const dateStr = startDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+                    const timeStr = startDate.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+                    const durationMin = Math.round(session.completedSeconds / 60)
+                    const targetMin = Math.round(session.duration / 60)
+                    return (
+                      <div
+                        key={session.id}
+                        className="flex items-center gap-3 px-5 py-2.5 hover:bg-accent/20 transition-colors"
+                      >
+                        <div className={cn(
+                          "flex size-7 shrink-0 items-center justify-center rounded-md",
+                          session.completed
+                            ? "bg-neon-emerald/10 text-neon-emerald"
+                            : "bg-rose-500/10 text-rose-400"
+                        )}>
+                          {session.completed ? (
+                            <CheckCircle2 className="size-3.5" />
+                          ) : (
+                            <AlertTriangle className="size-3.5" />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium text-foreground">
+                              {durationMin}m
+                            </span>
+                            <span className="text-[9px] text-muted-foreground/50">
+                              / {targetMin}m
+                            </span>
+                            <Badge variant="outline" className={cn(
+                              "text-[8px] h-4 px-1.5",
+                              session.completed
+                                ? "border-neon-emerald/20 text-neon-emerald"
+                                : "border-rose-500/20 text-rose-400"
+                            )}>
+                              {session.completed ? "Done" : "Stopped"}
+                            </Badge>
+                          </div>
+                          <div className="flex items-center gap-2 text-[9px] text-muted-foreground/60">
+                            <span>{dateStr} at {timeStr}</span>
+                            {session.distractionsBlocked > 0 && (
+                              <>
+                                <span>·</span>
+                                <ShieldBan className="size-2.5" />
+                                <span>{session.distractionsBlocked} blocked</span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-6 text-muted-foreground">
+                  <ListChecks className="size-6 text-muted-foreground/20 mb-1" />
+                  <p className="text-[11px]">No sessions yet</p>
+                  <p className="text-[9px] text-muted-foreground/50">
+                    Completed and interrupted sessions will appear here
                   </p>
                 </div>
               )}

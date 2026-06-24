@@ -17,6 +17,18 @@ import {
   Download,
   Sliders,
   CalendarDays,
+  Globe,
+  Headphones,
+  Gamepad2,
+  MessageSquare,
+  Cloud,
+  Code2,
+  Monitor,
+  Ellipsis,
+  PieChart,
+  TrendingDown,
+  Minus,
+  ArrowRight,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -189,6 +201,82 @@ function PerAppLimitInput({ exe, name, currentLimit, currentAutoBlock, onSet, on
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Burn-rate forecast helpers
+// ══════════════════════════════════════════════════════════════════════════
+
+type BurnForecast = {
+  label: string
+  detail: string
+  type: 'on_track' | 'warning' | 'danger' | 'insufficient'
+}
+
+function forecastDaily(usedMB: number, limitMB: number): BurnForecast {
+  if (usedMB >= limitMB) return { label: "Exhausted", detail: "Daily budget used up", type: "danger" }
+  if (usedMB <= 0 || limitMB <= 0) return { label: "\u2014", detail: "No data yet", type: "insufficient" }
+
+  const now = new Date()
+  const minutesElapsed = now.getHours() * 60 + now.getMinutes()
+  if (minutesElapsed < 5) return { label: "Collecting\u2026", detail: "Less than 5 min of data", type: "insufficient" }
+
+  const hourlyRate = usedMB / (minutesElapsed / 60)
+  const remainingMB = limitMB - usedMB
+  const hoursUntilExhaust = remainingMB / hourlyRate
+  const minsUntilExhaust = hoursUntilExhaust * 60
+
+  if (minsUntilExhaust > 24 * 60 - minutesElapsed) {
+    const endOfDayProjection = usedMB + hourlyRate * ((24 * 60 - minutesElapsed) / 60)
+    const projectedGB = (endOfDayProjection / 1024).toFixed(1)
+    return { label: `\u2248 ${projectedGB} GB today`, detail: `${hourlyRate.toFixed(0)} MB/hr \u00b7 under limit`, type: "on_track" }
+  }
+
+  const exhaustionDate = new Date(now.getTime() + hoursUntilExhaust * 60 * 60 * 1000)
+  const timeStr = exhaustionDate.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  return { label: `Exhaust by ${timeStr}`, detail: `${hourlyRate.toFixed(0)} MB/hr burn rate`, type: "warning" }
+}
+
+function forecastWeekly(usedMB: number, limitMB: number): BurnForecast {
+  if (usedMB >= limitMB) return { label: "Exhausted", detail: "Weekly budget used up", type: "danger" }
+  if (usedMB <= 0 || limitMB <= 0) return { label: "\u2014", detail: "No data yet", type: "insufficient" }
+
+  const now = new Date()
+  // getDay(): 0=Sun \u2192 map to Mon=1..Sun=7
+  const dayOfWeek = now.getDay() === 0 ? 7 : now.getDay()
+  if (dayOfWeek < 1) return { label: "Collecting\u2026", detail: "Just started the week", type: "insufficient" }
+
+  const dailyRate = usedMB / dayOfWeek
+  const daysRemaining = 7 - dayOfWeek
+  const projectedTotal = usedMB + dailyRate * daysRemaining
+  const projectedGB = (projectedTotal / 1024).toFixed(1)
+  const limitGB = (limitMB / 1024).toFixed(1)
+
+  if (projectedTotal >= limitMB) {
+    return { label: `Projected: ${projectedGB} GB`, detail: `Will exceed ${limitGB} GB limit`, type: "warning" }
+  }
+  return { label: `On track: ${projectedGB} GB`, detail: `${dailyRate.toFixed(0)} MB/day avg \u00b7 under ${limitGB} GB`, type: "on_track" }
+}
+
+function forecastMonthly(usedMB: number, limitMB: number): BurnForecast {
+  if (usedMB >= limitMB) return { label: "Exhausted", detail: "Monthly budget used up", type: "danger" }
+  if (usedMB <= 0 || limitMB <= 0) return { label: "\u2014", detail: "No data yet", type: "insufficient" }
+
+  const now = new Date()
+  const dayOfMonth = now.getDate()
+  if (dayOfMonth < 1) return { label: "Collecting\u2026", detail: "Just started the month", type: "insufficient" }
+
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+  const dailyRate = usedMB / dayOfMonth
+  const daysRemaining = daysInMonth - dayOfMonth
+  const projectedTotal = usedMB + dailyRate * daysRemaining
+  const projectedGB = (projectedTotal / 1024).toFixed(1)
+  const limitGB = (limitMB / 1024).toFixed(1)
+
+  if (projectedTotal >= limitMB) {
+    return { label: `Projected: ${projectedGB} GB`, detail: `Will exceed ${limitGB} GB limit`, type: "warning" }
+  }
+  return { label: `On track: ${projectedGB} GB`, detail: `${dailyRate.toFixed(0)} MB/day avg \u00b7 under ${limitGB} GB`, type: "on_track" }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Constants
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -204,6 +292,60 @@ const EXCEED_ACTIONS: { value: BudgetExceedAction; label: string; desc: string }
   { value: "block_non_essential", label: "Block Non-Essential", desc: "Auto-block apps not marked essential" },
   { value: "block_all", label: "Block All", desc: "Block everything except essential system apps" },
 ]
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Category definitions for data usage aggregation
+// ════════════════════════════════════════════════════════════════════════════════
+
+interface DataCategory {
+  id: string
+  label: string
+  icon: string
+  color: string
+  match: (exe: string) => boolean
+}
+
+const DATA_CATEGORIES: DataCategory[] = [
+  { id: "browsers", label: "Browsers", icon: "Globe", color: "oklch(0.62 0.17 240)", match: e => /chrome\.exe|msedge\.exe|firefox\.exe|brave\.exe|opera\.exe|safari\.exe|vivaldi\.exe/i.test(e) },
+  { id: "streaming", label: "Streaming", icon: "Headphones", color: "oklch(0.72 0.19 165)", match: e => /spotify\.exe|vlc\.exe|wmplayer\.exe|groove\.exe|mpc-hc\.exe|netflix/i.test(e) },
+  { id: "gaming", label: "Gaming", icon: "Gamepad2", color: "oklch(0.7 0.2 35)", match: e => /steam\.exe|epicgameslauncher\.exe|battle\.net|origin\.exe|uplay\.exe|xbox\.exe|riot|valorant|league|ubisoft|blizzard|nvidia/i.test(e) },
+  { id: "communication", label: "Communication", icon: "MessageSquare", color: "oklch(0.65 0.22 290)", match: e => /discord\.exe|slack\.exe|teams\.exe|zoom\.exe|skype\.exe|telegram|whatsapp|signal|outlook\.exe/i.test(e) },
+  { id: "cloud", label: "Cloud Sync", icon: "Cloud", color: "oklch(0.7 0.15 60)", match: e => /onedrive\.exe|dropbox\.exe|googledrive|icloud|box\.exe|mega/i.test(e) },
+  { id: "dev", label: "Development", icon: "Code2", color: "oklch(0.68 0.18 200)", match: e => /code\.exe|git\.exe|node\.exe|npm|docker|vscode|terminal|powershell|cmd\.exe|python/i.test(e) },
+  { id: "system", label: "System", icon: "Monitor", color: "oklch(0.6 0.12 264)", match: e => /svchost|msmpeng|services|lsass|csrss|winlogon|wuauserv|searchindexer|compatTel|system|idle/i.test(e) },
+]
+
+/** Category ID to icon component mapping */
+const CATEGORY_ICONS: Record<string, any> = {
+  Globe, Headphones, Gamepad2, MessageSquare, Cloud, Code2, Monitor, Ellipsis,
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Week-over-week comparison helpers
+// ══════════════════════════════════════════════════════════════════════════
+
+function getISOWeek(date: Date): string {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+  const dayNum = d.getUTCDay() || 7
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum)
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
+  const weekNo = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+  return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`
+}
+
+/** Compute the current ISO week key for display */
+function getCurrentWeekLabel(): string {
+  const now = new Date()
+  const week = getISOWeek(now)
+  // Compute Monday of this week
+  const dayOfWeek = now.getDay() || 7 // Mon=1..Sun=7
+  const monday = new Date(now)
+  monday.setDate(now.getDate() - (dayOfWeek - 1))
+  const sunday = new Date(monday)
+  sunday.setDate(monday.getDate() + 6)
+  const fmt = (d: Date) => d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+  return `${week} (${fmt(monday)} – ${fmt(sunday)})`
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // DataBudget page
@@ -236,6 +378,7 @@ export function DataBudget() {
   const [editThresholds, setEditThresholds] = useState<number[]>([...budgetSettings.thresholds])
   const [editAction, setEditAction] = useState<BudgetExceedAction>(budgetSettings.onExceed)
   const [editEssential, setEditEssential] = useState<string[]>([...budgetSettings.essentialApps])
+  const [editCustomAlert, setEditCustomAlert] = useState(budgetSettings.customAlertMB)
   const [newEssentialApp, setNewEssentialApp] = useState("")
   const [saved, setSaved] = useState(false)
 
@@ -247,6 +390,7 @@ export function DataBudget() {
     setEditThresholds([...budgetSettings.thresholds])
     setEditAction(budgetSettings.onExceed)
     setEditEssential([...budgetSettings.essentialApps])
+    setEditCustomAlert(budgetSettings.customAlertMB)
     setSynced(true)
   }
 
@@ -265,6 +409,11 @@ export function DataBudget() {
   const weeklyPct = Math.min((weeklyUsedMB / Math.max(editWeekly, 1)) * 100, 100)
   const monthlyPct = Math.min((monthlyUsedMB / Math.max(editMonthly, 1)) * 100, 100)
 
+  // ── Burn-rate forecasts ────────────────────────────────────────
+  const dailyForecast = useMemo(() => forecastDaily(dailyUsedMB, editDaily), [dailyUsedMB, editDaily])
+  const weeklyForecast = useMemo(() => forecastWeekly(weeklyUsedMB, editWeekly), [weeklyUsedMB, editWeekly])
+  const monthlyForecast = useMemo(() => forecastMonthly(monthlyUsedMB, editMonthly), [monthlyUsedMB, editMonthly])
+
   const handleSave = () => {
     updateBudgetSettings({
       dailyLimitMB: editDaily,
@@ -273,6 +422,7 @@ export function DataBudget() {
       thresholds: editThresholds,
       onExceed: editAction,
       essentialApps: editEssential,
+      customAlertMB: editCustomAlert,
     })
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
@@ -303,6 +453,45 @@ export function DataBudget() {
     [processes]
   )
 
+  // ── Category aggregates ───────────────────────────────────────────
+  const categoryData = useMemo(() => {
+    const cats = DATA_CATEGORIES.map(c => ({
+      id: c.id,
+      label: c.label,
+      icon: c.icon,
+      color: c.color,
+      totalMB: 0,
+      appCount: 0,
+      apps: [] as string[],
+    }))
+    let otherMB = 0
+    let otherCount = 0
+
+    for (const proc of processes) {
+      const matched = cats.find(c => {
+        const rule = DATA_CATEGORIES.find(r => r.id === c.id)
+        return rule ? rule.match(proc.exe) : false
+      })
+      if (matched) {
+        matched.totalMB += proc.sessionData
+        matched.appCount++
+        matched.apps.push(proc.name)
+      } else {
+        otherMB += proc.sessionData
+        otherCount++
+      }
+    }
+
+    const all = [...cats, { id: "other", label: "Other", icon: "Ellipsis", color: "oklch(0.55 0.1 264)", totalMB: otherMB, appCount: otherCount, apps: [] }]
+    const grandTotal = all.reduce((s, c) => s + c.totalMB, 0)
+
+    // Sort by usage descending, keep "Other" last
+    const sorted = all.filter(c => c.totalMB > 0).sort((a, b) => b.totalMB - a.totalMB)
+    const otherEntry = sorted.find(c => c.id === "other")
+    const rest = sorted.filter(c => c.id !== "other")
+    return { categories: otherEntry ? [...rest, otherEntry] : rest, grandTotal }
+  }, [processes])
+
   // ── History data ─────────────────────────────────────────────────
 
   // Timeline: raw usage values from snapshots
@@ -325,6 +514,67 @@ export function DataBudget() {
     }
     // Show last 14 days
     return entries.slice(-14)
+  }, [budgetHistory])
+
+  // ── Period comparison (week-over-week, day-over-day) ────────────
+  const periodComparison = useMemo(() => {
+    if (budgetHistory.length < 2) return null
+
+    // Group by ISO week
+    const weekMap = new Map<string, number>()
+    // Group by day
+    const dayMap = new Map<string, number>()
+
+    for (const snap of budgetHistory) {
+      const date = new Date(snap.timestamp)
+      const weekKey = getISOWeek(date)
+      const dayKey = snap.timestamp.slice(0, 10) // YYYY-MM-DD
+
+      // Take the max value per period as the cumulative usage at that point
+      const prevWeek = weekMap.get(weekKey) || 0
+      if (snap.usageMB > prevWeek) weekMap.set(weekKey, snap.usageMB)
+
+      const prevDay = dayMap.get(dayKey) || 0
+      if (snap.usageMB > prevDay) dayMap.set(dayKey, snap.usageMB)
+    }
+
+    // Sort weeks chronologically
+    const sortedWeeks = [...weekMap.entries()].sort(([a], [b]) => a.localeCompare(b))
+    const sortedDays = [...dayMap.entries()].sort(([a], [b]) => a.localeCompare(b))
+
+    const todayKey = new Date().toISOString().slice(0, 10)
+    const yesterdayDate = new Date()
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1)
+    const yesterdayKey = yesterdayDate.toISOString().slice(0, 10)
+
+    // Current week (the last week in data, which should be the ongoing week)
+    const currentWeekEntry = sortedWeeks[sortedWeeks.length - 1]
+    const prevWeekEntry = sortedWeeks.length >= 2 ? sortedWeeks[sortedWeeks.length - 2] : null
+
+    // Today vs yesterday
+    const todayUsage = dayMap.get(todayKey) || 0
+    const yesterdayUsage = dayMap.get(yesterdayKey) || 0
+
+    // This week total vs last week total
+    const thisWeekMB = currentWeekEntry ? currentWeekEntry[1] : 0
+    const lastWeekMB = prevWeekEntry ? prevWeekEntry[1] : 0
+    const thisWeekLabel = currentWeekEntry ? currentWeekEntry[0] : ""
+    const lastWeekLabel = prevWeekEntry ? prevWeekEntry[0] : ""
+
+    return {
+      // Week over week
+      thisWeekMB,
+      lastWeekMB,
+      thisWeekLabel,
+      lastWeekLabel,
+      weekDelta: lastWeekMB > 0 ? ((thisWeekMB - lastWeekMB) / lastWeekMB) * 100 : null,
+      hasWeekData: sortedWeeks.length >= 2,
+      // Day over day
+      todayMB: todayUsage,
+      yesterdayMB: yesterdayUsage,
+      dayDelta: yesterdayUsage > 0 ? ((todayUsage - yesterdayUsage) / yesterdayUsage) * 100 : null,
+      hasDayData: yesterdayUsage > 0,
+    }
   }, [budgetHistory])
 
   // Monthly aggregates
@@ -517,6 +767,15 @@ export function DataBudget() {
                     </Badge>
                   )}
                 </div>
+
+                {/* Forecast */}
+                <div className="flex items-center justify-center gap-1.5 mt-1">
+                  <Clock className={cn("size-3", dailyForecast.type === "danger" ? "text-destructive" : dailyForecast.type === "warning" ? "text-amber-400" : dailyForecast.type === "on_track" ? "text-neon-emerald" : "text-muted-foreground/40")} />
+                  <span className={cn("text-[10px] font-medium", dailyForecast.type === "danger" ? "text-destructive" : dailyForecast.type === "warning" ? "text-amber-400" : dailyForecast.type === "on_track" ? "text-foreground/80" : "text-muted-foreground/40")}>
+                    {dailyForecast.label}
+                  </span>
+                  <span className="text-[8px] text-muted-foreground/40">{dailyForecast.detail}</span>
+                </div>
               </CardContent>
             </Card>
 
@@ -582,6 +841,15 @@ export function DataBudget() {
                     </Badge>
                   )}
                 </div>
+
+                {/* Forecast */}
+                <div className="flex items-center justify-center gap-1.5 mt-1">
+                  <Clock className={cn("size-3", weeklyForecast.type === "danger" ? "text-destructive" : weeklyForecast.type === "warning" ? "text-amber-400" : weeklyForecast.type === "on_track" ? "text-neon-emerald" : "text-muted-foreground/40")} />
+                  <span className={cn("text-[10px] font-medium", weeklyForecast.type === "danger" ? "text-destructive" : weeklyForecast.type === "warning" ? "text-amber-400" : weeklyForecast.type === "on_track" ? "text-foreground/80" : "text-muted-foreground/40")}>
+                    {weeklyForecast.label}
+                  </span>
+                  <span className="text-[8px] text-muted-foreground/40">{weeklyForecast.detail}</span>
+                </div>
               </CardContent>
             </Card>
 
@@ -646,6 +914,15 @@ export function DataBudget() {
                       <AlertTriangle className="size-3" /> EXCEEDED
                     </Badge>
                   )}
+                </div>
+
+                {/* Forecast */}
+                <div className="flex items-center justify-center gap-1.5 mt-1">
+                  <Clock className={cn("size-3", monthlyForecast.type === "danger" ? "text-destructive" : monthlyForecast.type === "warning" ? "text-amber-400" : monthlyForecast.type === "on_track" ? "text-neon-emerald" : "text-muted-foreground/40")} />
+                  <span className={cn("text-[10px] font-medium", monthlyForecast.type === "danger" ? "text-destructive" : monthlyForecast.type === "warning" ? "text-amber-400" : monthlyForecast.type === "on_track" ? "text-foreground/80" : "text-muted-foreground/40")}>
+                    {monthlyForecast.label}
+                  </span>
+                  <span className="text-[8px] text-muted-foreground/40">{monthlyForecast.detail}</span>
                 </div>
               </CardContent>
             </Card>
@@ -757,6 +1034,49 @@ export function DataBudget() {
                       ))}
                     </SelectContent>
                   </Select>
+                </div>
+                <Separator />
+                <div>
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <AlertTriangle className="size-3.5 text-muted-foreground" />
+                    <label className="text-xs font-medium text-muted-foreground">Custom Alert Level</label>
+                  </div>
+                  <p className="text-[10px] text-muted-foreground/60 mb-2">
+                    Get a one-time notification when usage reaches this absolute MB value (set to 0 to disable)
+                  </p>
+                  <div className="flex items-center gap-3">
+                    <Input
+                      type="number" min={0} max={100000}
+                      value={editCustomAlert}
+                      onChange={(e) => setEditCustomAlert(Math.max(0, Number(e.target.value) || 0))}
+                      className="w-32 font-mono text-sm"
+                      placeholder="0 = off"
+                    />
+                    {editCustomAlert > 0 && (
+                      <div className="flex items-center gap-1.5">
+                        <div className={cn(
+                          "h-1.5 w-16 rounded-full",
+                          dailyUsedMB >= editCustomAlert ? "bg-destructive" :
+                          dailyUsedMB >= editCustomAlert * 0.8 ? "bg-amber-500" :
+                          "bg-muted/50"
+                        )}>
+                          <div
+                            className={cn(
+                              "h-full rounded-full transition-all duration-300",
+                              dailyUsedMB >= editCustomAlert ? "bg-destructive" : "bg-neon-cyan/70"
+                            )}
+                            style={{ width: `${Math.min((dailyUsedMB / Math.max(editCustomAlert, 1)) * 100, 100)}%` }}
+                          />
+                        </div>
+                        <span className={cn(
+                          "text-[10px] font-mono tabular-nums",
+                          dailyUsedMB >= editCustomAlert ? "text-destructive" : "text-muted-foreground/80"
+                        )}>
+                          {dailyUsedMB.toFixed(0)} / {editCustomAlert} MB
+                        </span>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </CardContent>
             </Card>
@@ -915,6 +1235,91 @@ export function DataBudget() {
               )}
             </CardContent>
           </Card>
+
+          {/* Data by Category */}
+          <Card className="border-border bg-card">
+            <CardHeader className="pb-3 border-b border-border">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  <PieChart className="size-4 text-neon-cyan" />
+                  Data by Category
+                </CardTitle>
+                <Badge variant="outline" className="text-[9px]">
+                  {categoryData.categories.reduce((s, c) => s + c.appCount, 0)} apps
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="p-5">
+              {categoryData.grandTotal > 0 ? (
+                <div className="space-y-3">
+                  {/* Stacked summary bar */}
+                  <div className="flex h-3 rounded-full overflow-hidden bg-muted/40">
+                    {categoryData.categories.map((cat) => {
+                      const pct = (cat.totalMB / Math.max(categoryData.grandTotal, 1)) * 100
+                      if (pct < 1) return null
+                      return (
+                        <div
+                          key={cat.id}
+                          className="h-full transition-all duration-500 first:rounded-l-full last:rounded-r-full"
+                          style={{
+                            width: `${pct}%`,
+                            backgroundColor: cat.color,
+                          }}
+                          title={`${cat.label}: ${cat.totalMB.toFixed(1)} MB (${pct.toFixed(1)}%)`}
+                        />
+                      )
+                    })}
+                  </div>
+
+                  {/* Category detail rows */}
+                  <div className="space-y-1.5 pt-1">
+                    {categoryData.categories.map((cat) => {
+                      const pct = (cat.totalMB / Math.max(categoryData.grandTotal, 1)) * 100
+                      const Icon = CATEGORY_ICONS[cat.icon]
+                      return (
+                        <div
+                          key={cat.id}
+                          className="group grid grid-cols-[auto_1fr_auto] gap-3 items-center py-1.5 px-2 rounded-md hover:bg-accent/20 transition-colors"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            {Icon && <Icon className="size-3.5 shrink-0" style={{ color: cat.color }} />}
+                            <span className="text-xs font-medium text-foreground truncate">{cat.label}</span>
+                          </div>
+                          <div className="h-4 rounded-sm bg-muted/20 overflow-hidden">
+                            <div
+                              className="h-full rounded-sm transition-all duration-500"
+                              style={{
+                                width: `${Math.max(pct > 0 ? 1 : 0, pct)}%`,
+                                backgroundColor: cat.color,
+                                opacity: 0.7,
+                              }}
+                            />
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-xs font-mono tabular-nums text-foreground/80 text-right w-14">
+                              {cat.totalMB.toFixed(1)} MB
+                            </span>
+                            <span className="text-[9px] text-muted-foreground/50 w-8 text-right">
+                              {pct.toFixed(0)}%
+                            </span>
+                            {cat.appCount > 1 && (
+                              <Badge variant="outline" className="text-[8px] h-4 px-1 border-border/50 text-muted-foreground/60 w-7 justify-center">
+                                {cat.appCount}
+                              </Badge>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center py-6 text-muted-foreground text-sm">
+                  <span>No process data available yet</span>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </>
       )}
 
@@ -967,6 +1372,110 @@ export function DataBudget() {
                       <span>{budgetHistory[budgetHistory.length - 1]?.timestamp.slice(11, 19) || "now"}</span>
                     </div>
                   </div>
+
+                  {/* Period Comparison */}
+                  {periodComparison && (periodComparison.hasDayData || periodComparison.hasWeekData) && (
+                    <div>
+                      <div className="flex items-center gap-1.5 mb-3">
+                        <TrendingUp className="size-3.5 text-neon-cyan" />
+                        <span className="text-[11px] font-medium text-foreground">Period Comparison</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        {/* Day over day */}
+                        <div className="rounded-lg border border-border bg-muted/20 p-3">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-[9px] font-semibold uppercase tracking-widest text-muted-foreground/60">
+                              Today vs Yesterday
+                            </span>
+                            {periodComparison.dayDelta !== null && (
+                              <span className={cn(
+                                "flex items-center gap-0.5 text-[10px] font-bold tabular-nums",
+                                periodComparison.dayDelta > 5 ? "text-destructive" :
+                                periodComparison.dayDelta < -5 ? "text-neon-emerald" :
+                                "text-muted-foreground/60"
+                              )}>
+                                {periodComparison.dayDelta > 0 ? (
+                                  <TrendingUp className="size-3" />
+                                ) : periodComparison.dayDelta < 0 ? (
+                                  <TrendingDown className="size-3" />
+                                ) : (
+                                  <Minus className="size-3" />
+                                )}
+                                {periodComparison.dayDelta > 0 ? "+" : ""}{periodComparison.dayDelta.toFixed(1)}%
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <div className="text-center flex-1">
+                              <p className="text-lg font-bold text-foreground tabular-nums">
+                                {periodComparison.todayMB.toFixed(0)}
+                              </p>
+                              <p className="text-[9px] text-muted-foreground/60">Today</p>
+                            </div>
+                            <div className="text-muted-foreground/20">
+                              <ArrowRight className="size-4" />
+                            </div>
+                            <div className="text-center flex-1">
+                              <p className="text-lg font-bold text-muted-foreground/70 tabular-nums">
+                                {periodComparison.yesterdayMB.toFixed(0)}
+                              </p>
+                              <p className="text-[9px] text-muted-foreground/60">Yesterday</p>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Week over week */}
+                        <div className="rounded-lg border border-border bg-muted/20 p-3">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-[9px] font-semibold uppercase tracking-widest text-muted-foreground/60">
+                              This Week vs Last Week
+                            </span>
+                            {periodComparison.hasWeekData && periodComparison.weekDelta !== null && (
+                              <span className={cn(
+                                "flex items-center gap-0.5 text-[10px] font-bold tabular-nums",
+                                periodComparison.weekDelta > 5 ? "text-destructive" :
+                                periodComparison.weekDelta < -5 ? "text-neon-emerald" :
+                                "text-muted-foreground/60"
+                              )}>
+                                {periodComparison.weekDelta > 0 ? (
+                                  <TrendingUp className="size-3" />
+                                ) : periodComparison.weekDelta < 0 ? (
+                                  <TrendingDown className="size-3" />
+                                ) : (
+                                  <Minus className="size-3" />
+                                )}
+                                {periodComparison.weekDelta > 0 ? "+" : ""}{periodComparison.weekDelta.toFixed(1)}%
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <div className="text-center flex-1">
+                              <p className="text-lg font-bold text-foreground tabular-nums">
+                                {periodComparison.thisWeekMB.toFixed(0)}
+                              </p>
+                              <p className="text-[9px] text-muted-foreground/60" title={getCurrentWeekLabel()}>
+                                This Week
+                              </p>
+                            </div>
+                            <div className="text-muted-foreground/20">
+                              <ArrowRight className="size-4" />
+                            </div>
+                            <div className="text-center flex-1">
+                              <p className="text-lg font-bold text-muted-foreground/70 tabular-nums">
+                                {periodComparison.lastWeekMB.toFixed(0)}
+                              </p>
+                              <p className="text-[9px] text-muted-foreground/60">Last Week</p>
+                            </div>
+                          </div>
+                          {!periodComparison.hasWeekData && (
+                            <p className="text-[9px] text-muted-foreground/40 text-center mt-1">
+                              Need 2+ weeks of data
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Daily trend bars */}
                   {dailyBars.length > 0 && (
