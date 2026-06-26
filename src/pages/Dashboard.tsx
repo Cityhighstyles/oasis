@@ -136,6 +136,7 @@ function CarbonRing({ grams }: { grams: number }) {
       </text>
     </svg>
   )
+  
 }
 
 function formatSpeed(bytesPerSecond: number): string {

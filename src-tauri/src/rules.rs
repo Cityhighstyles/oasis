@@ -330,6 +330,21 @@ impl RulesManager {
         registry.contains(&exe_name.to_lowercase())
     }
 
+    /// Return the IDs of all **enabled** rules whose targets include the given
+    /// executable name (case-insensitive).
+    ///
+    /// Used by the engine poll loop to attribute blocked byte deltas to
+    /// individual rules so `data_blocked_bytes` reflects real traffic.
+    pub fn get_matching_rule_ids(&self, exe_name: &str) -> Vec<String> {
+        let rules = self.rules.lock().unwrap();
+        let exe_lower = exe_name.to_lowercase();
+        rules
+            .values()
+            .filter(|r| r.enabled && r.targets.iter().any(|t| t == &exe_lower))
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
     /// Delete a rule by id. Removes it from the map, rebuilds the registry,
     /// persists, and returns the deleted rule&#x27;s data.
     ///

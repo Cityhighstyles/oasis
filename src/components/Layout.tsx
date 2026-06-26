@@ -1,3 +1,4 @@
+import { useState, useCallback } from "react"
 import { NavLink, Outlet } from "react-router-dom"
 import {
   LayoutDashboard,
@@ -12,10 +13,21 @@ import {
   ShieldOff,
   Wifi,
   ChevronRight,
+  PauseCircle,
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { Toaster } from "@/components/ui/sonner"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { useShield } from "@/context/ShieldContext"
 import { cn } from "@/lib/utils"
 
@@ -31,7 +43,25 @@ const NAV_ITEMS = [
 ]
 
 export function Layout() {
-  const { isShieldActive, toggleShield } = useShield()
+  const { isShieldActive, toggleShield, suspendedPids } = useShield()
+  const [shieldConfirmOpen, setShieldConfirmOpen] = useState(false)
+
+  const handleShieldToggle = useCallback(
+    (checked: boolean) => {
+      // If turning shield OFF and there are suspended processes, show confirmation
+      if (!checked && isShieldActive && suspendedPids.size > 0) {
+        setShieldConfirmOpen(true)
+        return
+      }
+      toggleShield()
+    },
+    [isShieldActive, suspendedPids, toggleShield]
+  )
+
+  const confirmShieldToggle = useCallback(() => {
+    setShieldConfirmOpen(false)
+    toggleShield()
+  }, [toggleShield])
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background">
@@ -143,7 +173,7 @@ export function Layout() {
               </div>
               <Switch
                 checked={isShieldActive}
-                onCheckedChange={toggleShield}
+                onCheckedChange={handleShieldToggle}
                 className={cn(
                   "transition-all duration-300",
                   isShieldActive
@@ -180,6 +210,33 @@ export function Layout() {
           </div>
         </main>
       </div>
+
+      {/* Suspend confirmation dialog */}
+      <AlertDialog open={shieldConfirmOpen} onOpenChange={setShieldConfirmOpen}>
+        <AlertDialogContent className="border-border bg-card">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-foreground flex items-center gap-2">
+              <PauseCircle className="size-4 text-amber-400" />
+              Deactivate Shield?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-muted-foreground">
+              There are <span className="font-semibold text-foreground">{suspendedPids.size} suspended process{suspendedPids.size !== 1 ? "es" : ""}</span>.
+              Deactivating the shield will resume them. Are you sure you want to continue?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-border text-muted-foreground hover:bg-muted/40 hover:text-foreground">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmShieldToggle}
+              className="bg-amber-500 text-black hover:bg-amber-500/90 font-medium"
+            >
+              Resume & Deactivate
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Toast notifications */}
       <Toaster position="bottom-right" richColors closeButton />

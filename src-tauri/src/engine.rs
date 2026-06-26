@@ -30,6 +30,9 @@ use crate::iphelper::{self, ProcessNetStats};
 #[cfg(target_os = "windows")]
 use crate::wfp::WfpEngine;
 
+#[cfg(target_os = "windows")]
+use crate::procctl;
+
 // ── Non-Windows stubs (CI / docs builds) ─────────────────────────────────────
 #[cfg(not(target_os = "windows"))]
 mod stub {
@@ -152,14 +155,26 @@ impl NetworkEngine {
     }
 
     /// Set the master shield active state.
-    /// When deactivating, drain all auto-blocked paths and unblock every
-    /// WFP filter that was installed by the AutoBlockRegistry.
+    /// When deactivating:
+    ///   - Drain all auto-blocked paths and unblock every WFP filter
+    ///   - Resume every process that was suspended by the user
     pub fn set_shield_active(&mut self, active: bool) {
         self.is_shield_active = active;
         if !active {
+            // Unblock WFP filters installed by the AutoBlockRegistry
             for (_lower, original) in self.auto_blocked_paths.drain() {
                 if let Err(e) = self.wfp.unblock_app(&original) {
-                    log::warn!("Shield deactivation cleanup failed for {}: {e}", original);
+                    log::warn!("Shield deactivation WFP cleanup failed for {}: {e}", original);
+                }
+            }
+            // Resume all processes that were suspended
+            #[cfg(target_os = "windows")]
+            {
+                let pids: Vec<u32> = self.suspended_pids.drain().collect();
+                for pid in pids {
+                    if let Err(e) = procctl::resume_process(pid) {
+                        log::warn!("Shield deactivation resume failed for PID {pid}: {e}");
+                    }
                 }
             }
         }
@@ -354,6 +369,15 @@ impl NetworkEngine {
                 delta_bytes,
                 is_blocked,
             );
+
+            // Attribute blocked bytes to matching rules so that
+            // rule.data_blocked_bytes reflects real traffic, not hardcoded defaults.
+            if registry_blocked && delta_bytes > 0 {
+                let matching_ids = self.rules_manager.get_matching_rule_ids(&exe_name);
+                for rule_id in matching_ids {
+                    self.rules_manager.add_blocked_bytes(&rule_id, delta_bytes);
+                }
+            }
 
             new_entries.push(ProcessEntry {
                 pid: *pid,

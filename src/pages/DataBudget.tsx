@@ -289,8 +289,8 @@ const THRESHOLD_OPTIONS = [
 
 const EXCEED_ACTIONS: { value: BudgetExceedAction; label: string; desc: string }[] = [
   { value: "notify_only", label: "Notify Only", desc: "Show a toast warning" },
-  { value: "block_non_essential", label: "Block Non-Essential", desc: "Auto-block apps not marked essential" },
-  { value: "block_all", label: "Block All", desc: "Block everything except essential system apps" },
+  { value: "block_non_essential", label: "Block Non-Essential", desc: "Auto-block apps not marked essential via WFP" },
+  { value: "block_all", label: "Block All", desc: "Block everything except essential system apps via WFP" },
 ]
 
 // ════════════════════════════════════════════════════════════════════════════════

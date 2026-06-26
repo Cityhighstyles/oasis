@@ -5,13 +5,10 @@ import {
   ChevronUp,
   ChevronDown,
   ChevronRight,
-  Shield,
-  ShieldOff,
   MoreVertical,
   PauseCircle,
   PlayCircle,
   Trash2,
-  ShieldBan,
   ArrowDownWideNarrow,
   ArrowDownAZ,
 } from "lucide-react"
@@ -138,7 +135,7 @@ function StatusBadge({ status, className }: StatusBadgeProps) {
 
 // ──────────────────── filter / system service helpers ────────────────
 
-type FilterPreset = "all" | "active" | "system" | "paused" | "blocked"
+type FilterPreset = "all" | "active" | "system" | "paused"
 
 function getExeName(path: string): string {
   return path.split(/[/\\]/).pop()?.toLowerCase() ?? ""
@@ -229,7 +226,6 @@ function MicroSparkline({ samples, maxVal, trend = "stable" }: { samples: number
 type ProcessRowProps = {
   proc: ProcessEntry
   isOperating: string | null
-  onToggleBlock: (proc: ProcessEntry) => void
   wfpAvailable: boolean
   isSuspended: boolean
   onSuspend: (pid: number) => void
@@ -240,9 +236,8 @@ type ProcessRowProps = {
   isLocked: boolean
 }
 
-function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended, onSuspend, onResume, onKill, onDropdownOpenChange, speedTrend, isLocked }: ProcessRowProps) {
+function PidSubRow({ proc, isOperating, wfpAvailable, isSuspended, onSuspend, onResume, onKill, onDropdownOpenChange, speedTrend, isLocked }: ProcessRowProps) {
   const s = STATUS_CONFIG[proc.status]
-  const isBlocked = proc.status === "blocked"
   const isOperatingNow = isOperating === proc.exe
 
   return (
@@ -339,20 +334,6 @@ function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-[160px]">
-            {/* Block / Unblock */}
-            <DropdownMenuItem
-              onClick={() => onToggleBlock(proc)}
-              disabled={isLocked || !wfpAvailable}
-              className="gap-2"
-            >
-              {isBlocked ? (
-                <ShieldOff className="size-3.5 text-neon-emerald" />
-              ) : (
-                <ShieldBan className="size-3.5 text-destructive" />
-              )}
-              <span>{isBlocked ? "Unblock Network" : "Block Network"}</span>
-            </DropdownMenuItem>
-
             {/* Suspend / Resume */}
             <DropdownMenuItem
               onClick={() => isSuspended ? onResume(proc.pid) : onSuspend(proc.pid)}
@@ -389,7 +370,7 @@ function PidSubRow({ proc, isOperating, onToggleBlock, wfpAvailable, isSuspended
 // ──────────────────────────── main component ─────────────────────────
 
 export function LiveMonitor() {
-  const { isShieldActive, processes, blockApp, unblockApp, refreshProcesses, wfpAvailable, suspendProcess, resumeProcess, killProcess, suspendedPids } = useShield()
+  const { isShieldActive, processes, refreshProcesses, wfpAvailable, suspendProcess, resumeProcess, killProcess, suspendedPids } = useShield()
   const [loading, setLoading] = useState<boolean>(true)
   const [search, setSearch] = useState("")
   const [sortField, setSortField] = useState<SortKey>("sessionData")
@@ -468,67 +449,6 @@ export function LiveMonitor() {
     },
     []
   )
-
-  const handleToggleBlock = async (proc: ProcessEntry) => {
-    const result = withLock(async () => {
-      setActionInProgress(proc.exe)
-      try {
-        if (proc.status === "blocked") {
-          await unblockApp(proc.exe)
-          toast.success("Network unblocked", {
-            description: `${proc.name} can now access the network`,
-          })
-        } else {
-          await blockApp(proc.exe)
-          toast.success("Network blocked", {
-            description: `${proc.name} has been blocked from the network`,
-          })
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        toast.error("Action failed", {
-          description: `Failed to ${proc.status === "blocked" ? "unblock" : "block"} ${proc.name}: ${msg}`,
-        })
-      } finally {
-        setActionInProgress(null)
-      }
-    })
-    if (result === undefined) {
-      toast.info("Please wait", { description: "Another action is still in progress." })
-    }
-  }
-
-  const handleGroupToggleBlock = async (group: ProcessGroup) => {
-    const result = withLock(async () => {
-      const isBlocked = group.status === "blocked"
-      setActionInProgress(group.exe)
-      try {
-        if (isBlocked) {
-          await unblockApp(group.exe)
-          toast.success("Network unblocked", {
-            description: `${group.name} (${group.pidCount} ${group.pidCount === 1 ? "PID" : "PIDs"
-              }) can now access the network`,
-          })
-        } else {
-          await blockApp(group.exe)
-          toast.success("Network blocked", {
-            description: `${group.name} (${group.pidCount} ${group.pidCount === 1 ? "PID" : "PIDs"
-              }) has been blocked from the network`,
-          })
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        toast.error("Action failed", {
-          description: `Failed to ${isBlocked ? "unblock" : "block"} ${group.name}: ${msg}`,
-        })
-      } finally {
-        setActionInProgress(null)
-      }
-    })
-    if (result === undefined) {
-      toast.info("Please wait", { description: "Another action is still in progress." })
-    }
-  }
 
   const toggleGroup = useCallback((key: string) => {
     setExpandedGroups((prev) => {
@@ -684,8 +604,6 @@ export function LiveMonitor() {
       filtered = filtered.filter((p) => p.status === "active")
     } else if (filterPreset === "system") {
       filtered = filtered.filter((p) => SYSTEM_SERVICE_EXES.has(getExeName(p.exe)))
-    } else if (filterPreset === "blocked") {
-      filtered = filtered.filter((p) => p.status === "blocked")
     } else if (filterPreset === "paused") {
       filtered = filtered.filter((p) => suspendedPids.has(p.pid))
     }
@@ -885,8 +803,7 @@ export function LiveMonitor() {
               { key: "active" as FilterPreset, label: "Active" },
               { key: "system" as FilterPreset, label: "System" },
               { key: "paused" as FilterPreset, label: "Paused" },
-              { key: "blocked" as FilterPreset, label: "Blocked" },
-            ]).map(({ key, label }) => (
+            ].map(({ key, label }) => (
               <button
                 key={key}
                 onClick={() => setFilterPreset(key)}
@@ -899,7 +816,7 @@ export function LiveMonitor() {
               >
                 {label}
               </button>
-            ))}
+            )))}
           </div>
         </CardHeader>
 
@@ -941,7 +858,6 @@ export function LiveMonitor() {
           >
             {groups.map((group) => {
               const s = STATUS_CONFIG[group.status]
-              const isBlocked = group.status === "blocked"
               const isExpanded = expandedGroups.has(group.key)
               const isOperating = actionInProgress === group.exe
               const groupAllSuspended = group.processes.every((p) =>
@@ -1080,35 +996,7 @@ export function LiveMonitor() {
                           )}
                         </Button>
 
-                        {/* Block / Unblock all */}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className={cn(
-                            "h-6 w-6 p-0",
-                            isBlocked
-                              ? "text-neon-emerald hover:text-neon-emerald hover:bg-neon-emerald/10"
-                              : "text-destructive hover:text-destructive hover:bg-destructive/10"
-                          )}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleGroupToggleBlock(group)
-                          }}
-                          disabled={!wfpAvailable || isOperating}
-                          title={
-                            isBlocked
-                              ? "Unblock all processes"
-                              : "Block all processes"
-                          }
-                        >
-                          {isOperating ? (
-                            <RefreshCw className="size-3 animate-spin" />
-                          ) : isBlocked ? (
-                            <ShieldOff className="size-3" />
-                          ) : (
-                            <Shield className="size-3" />
-                          )}
-                        </Button>
+          
                       </div>
                     </div>
                   </CollapsibleTrigger>
@@ -1124,7 +1012,6 @@ export function LiveMonitor() {
                             key={proc.pid}
                             proc={proc}
                             isOperating={actionInProgress}
-                            onToggleBlock={handleToggleBlock}
                             wfpAvailable={wfpAvailable}
                             isSuspended={suspendedPids.has(proc.pid)}
                             onSuspend={handleSuspend}

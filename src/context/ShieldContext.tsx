@@ -740,8 +740,8 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     } catch { return [] }
   })
 
-  // Track which non-essential apps have been auto-blocked due to budget
-  const budgetBlockedAppsRef = useRef<string[]>([])
+  // Track which executable paths have been auto-blocked via WFP due to budget
+  const budgetBlockedExesRef = useRef<string[]>([])
 
   // Track whether the custom alert has been fired today (value stored prevents re-fire on same value)
   const customAlertFiredRef = useRef<number>(0)
@@ -760,12 +760,13 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (budgetSettings.onExceed === "block_all") {
-      // Block ALL processes — hard network stop
-      for (const app of processes) {
-        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
+      // Block ALL processes via WFP — network stop while apps still run
+      const uniqueExes = [...new Set(processes.map(p => p.exe))]
+      for (const exe of uniqueExes) {
+        if (!budgetBlockedExesRef.current.includes(exe)) {
           try {
-            await blockApp(app.exe)
-            budgetBlockedAppsRef.current.push(app.exe)
+            await blockApp(exe)
+            budgetBlockedExesRef.current.push(exe)
           } catch {
             // Skip
           }
@@ -773,14 +774,16 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       }
     } else if (budgetSettings.onExceed === "block_non_essential") {
       // Block only non-essential apps (skip those in the essential list)
-      const appsToBlock = processes.filter(
-        p => !budgetSettings.essentialApps.some(e => p.exe.toLowerCase().includes(e.toLowerCase()))
-      )
-      for (const app of appsToBlock) {
-        if (!budgetBlockedAppsRef.current.includes(app.exe)) {
+      const exesToBlock = [...new Set(
+        processes
+          .filter(p => !budgetSettings.essentialApps.some(e => p.exe.toLowerCase().includes(e.toLowerCase())))
+          .map(p => p.exe)
+      )]
+      for (const exe of exesToBlock) {
+        if (!budgetBlockedExesRef.current.includes(exe)) {
           try {
-            await blockApp(app.exe)
-            budgetBlockedAppsRef.current.push(app.exe)
+            await blockApp(exe)
+            budgetBlockedExesRef.current.push(exe)
           } catch {
             // Skip
           }
@@ -794,9 +797,15 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   const enforcePerAppLimits = useCallback(async () => {
     if (perAppBudgets.length === 0) return
 
+    // Deduplicate by exe to avoid blocking the same binary multiple times
+    const processedExes = new Set<string>()
     for (const proc of processes) {
+      const exeKey = proc.exe.toLowerCase()
+      if (processedExes.has(exeKey)) continue
+      processedExes.add(exeKey)
+
       const budget = perAppBudgets.find(
-        p => p.exe.toLowerCase() === proc.exe.toLowerCase() && p.limitMB > 0
+        p => p.exe.toLowerCase() === exeKey && p.limitMB > 0
       )
       if (!budget) continue
 
@@ -808,7 +817,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
           await blockApp(proc.exe)
           perAppBlockedExesRef.current.push(proc.exe)
           toast.warning(`App data limit exceeded`, {
-            description: `${proc.name} (${proc.exe}) used ${proc.sessionData.toFixed(0)} MB — limit is ${budget.limitMB} MB. Auto-blocked.`,
+            description: `${proc.name} (${proc.exe}) used ${proc.sessionData.toFixed(0)} MB — limit is ${budget.limitMB} MB. Network blocked.`,
             duration: 5000,
           })
         } catch {
@@ -946,14 +955,14 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   }, [processes, budgetSettings, thresholdsHitToday, enforceBudgetBlock, enforcePerAppLimits])
 
   const unblockBudgetBlockedApps = useCallback(async () => {
-    for (const exe of budgetBlockedAppsRef.current) {
+    for (const exe of budgetBlockedExesRef.current) {
       try {
         await unblockApp(exe)
       } catch {
         // Skip
       }
     }
-    budgetBlockedAppsRef.current = []
+    budgetBlockedExesRef.current = []
   }, [unblockApp])
 
   const updateBudgetSettings = useCallback((settings: Partial<DataBudgetSettings>) => {
@@ -986,7 +995,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem("budget_per_app", JSON.stringify(perAppBudgets))
   }, [perAppBudgets])
 
-  // Track which apps have been auto-blocked due to per-app limits
+  // Track which executable paths have been auto-blocked via WFP due to per-app limits
   const perAppBlockedExesRef = useRef<string[]>([])
 
   const setPerAppBudget = useCallback((exe: string, name: string, limitMB: number, autoBlock: boolean) => {
@@ -1052,7 +1061,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem("budget_monthly_key")
     localStorage.removeItem("budget_thresholds_hit")
     await unblockBudgetBlockedApps()
-    // Unblock per-app blocked apps
+    // Unblock per-app blocked exes
     for (const exe of perAppBlockedExesRef.current) {
       try { await unblockApp(exe) } catch { }
     }
@@ -1260,13 +1269,16 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     setIsShieldActive(newState)
     // Sync shield state to the Rust backend so the engine can enforce
     // or release AutoBlockRegistry filters during its poll loop.
+    // When deactivating, the backend also resumes all suspended PIDs.
     try {
       await invoke("set_shield_active", { active: newState })
+      // Refresh suspended PIDs after shield toggle (backend may have resumed them)
+      await refreshSuspendedPids()
     } catch (err) {
       console.error("Failed to sync shield state:", err)
       setIsShieldActive(!newState) // revert on failure
     }
-  }, [isShieldActive])
+  }, [isShieldActive, refreshSuspendedPids])
 
   useEffect(() => {
     refreshWfpStatus()
