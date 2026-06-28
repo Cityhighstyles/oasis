@@ -157,54 +157,6 @@ const DEFAULT_BUDGET_SETTINGS: DataBudgetSettings = {
   customAlertMB: 0,
 }
 
-// ── Privacy Sentinel types ────────────────────────────────────────────────────
-
-/** Privacy risk level for an app */
-export type PrivacyRisk = "critical" | "high" | "medium" | "low" | "safe"
-
-/** Known tracking app entry with risk metadata */
-export interface KnownTracker {
-  /** Executable name (e.g. "chrome.exe") */
-  exe: string
-  /** Display name */
-  name: string
-  /** Risk category */
-  risk: PrivacyRisk
-  /** What data this app is known to collect */
-  dataCollected: string[]
-  /** Whether to auto-block this tracker */
-  autoBlock: boolean
-}
-
-/** Per-process privacy assessment */
-export interface PrivacyAssessment {
-  /** Executable path */
-  exe: string
-  /** Display name */
-  name: string
-  /** Computed privacy score (0 = worst, 100 = best) */
-  score: number
-  /** Risk level */
-  risk: PrivacyRisk
-  /** Number of active connections */
-  connections: number
-  /** Data transferred in MB */
-  dataMB: number
-  /** Reasons this app got this score */
-  reasons: string[]
-  /** Whether this app is currently blocked */
-  blocked: boolean
-}
-
-/** Privacy audit log entry */
-export interface PrivacyAuditEntry {
-  timestamp: string
-  appName: string
-  appExe: string
-  event: string
-  risk: PrivacyRisk
-}
-
 type ShieldContextType = {
   isShieldActive: boolean
   toggleShield: () => void
@@ -274,14 +226,6 @@ type ShieldContextType = {
   addDistractingApp: (exe: string, name: string, category: string) => void
   focusHistoryDays: { date: string; minutes: number }[]
   clearFocusSessions: () => void
-  // ── Privacy Sentinel ────────────────────────────────────────────────────
-  knownTrackers: KnownTracker[]
-  privacyAssessments: PrivacyAssessment[]
-  privacyAuditLog: PrivacyAuditEntry[]
-  overallPrivacyScore: number
-  toggleTrackerBlock: (exe: string) => void
-  refreshPrivacyAssessments: () => void
-  clearAuditLog: () => void
 }
 
 const ShieldContext = createContext<ShieldContextType | null>(null)
@@ -1068,155 +1012,6 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     perAppBlockedExesRef.current = []
   }, [unblockBudgetBlockedApps, unblockApp])
 
-  // ── Privacy Sentinel state ──────────────────────────────────────────────
-  const DEFAULT_KNOWN_TRACKERS: KnownTracker[] = [
-    { exe: "chrome.exe", name: "Google Chrome", risk: "high", dataCollected: ["Browsing history", "Location", "Search queries", "Device identifiers"], autoBlock: false },
-    { exe: "msedge.exe", name: "Microsoft Edge", risk: "high", dataCollected: ["Browsing history", "Location", "Search queries", "Diagnostic data"], autoBlock: false },
-    { exe: "firefox.exe", name: "Mozilla Firefox", risk: "medium", dataCollected: ["Browsing history", "Telemetry"], autoBlock: false },
-    { exe: "brave.exe", name: "Brave Browser", risk: "low", dataCollected: ["Basic telemetry"], autoBlock: false },
-    { exe: "onedrive.exe", name: "Microsoft OneDrive", risk: "high", dataCollected: ["File metadata", "Sync activity", "File content"], autoBlock: true },
-    { exe: "dropbox.exe", name: "Dropbox", risk: "high", dataCollected: ["File metadata", "Sync activity"], autoBlock: false },
-    { exe: "discord.exe", name: "Discord", risk: "high", dataCollected: ["Messages", "Voice data", "Presence", "Game activity"], autoBlock: false },
-    { exe: "slack.exe", name: "Slack", risk: "medium", dataCollected: ["Messages", "File uploads", "Presence"], autoBlock: false },
-    { exe: "teams.exe", name: "Microsoft Teams", risk: "high", dataCollected: ["Messages", "Call data", "Presence", "File content"], autoBlock: false },
-    { exe: "spotify.exe", name: "Spotify", risk: "medium", dataCollected: ["Listening history", "Device info", "Playlists"], autoBlock: false },
-    { exe: "googleupdater.exe", name: "Google Updater", risk: "medium", dataCollected: ["Update checks", "System info"], autoBlock: true },
-    { exe: "wuauserv.dll", name: "Windows Update", risk: "medium", dataCollected: ["System info", "Update history"], autoBlock: true },
-    { exe: "searchindexer.exe", name: "Windows Search", risk: "medium", dataCollected: ["File index", "Search queries"], autoBlock: false },
-    { exe: "compatTelRunner.exe", name: "Windows Compatibility Telemetry", risk: "high", dataCollected: ["Usage data", "Error reports", "Hardware info"], autoBlock: true },
-  ]
-
-  const [knownTrackers, setKnownTrackers] = useState<KnownTracker[]>(() => {
-    try {
-      const saved = localStorage.getItem("privacy_known_trackers")
-      return saved ? JSON.parse(saved) : DEFAULT_KNOWN_TRACKERS
-    } catch { return DEFAULT_KNOWN_TRACKERS }
-  })
-
-  const [privacyAuditLog, setPrivacyAuditLog] = useState<PrivacyAuditEntry[]>(() => {
-    try {
-      const saved = localStorage.getItem("privacy_audit_log")
-      return saved ? JSON.parse(saved) : []
-    } catch { return [] }
-  })
-
-  // Persist tracker settings
-  useEffect(() => {
-    localStorage.setItem("privacy_known_trackers", JSON.stringify(knownTrackers))
-  }, [knownTrackers])
-
-  // Persist audit log (keep last 50 entries)
-  useEffect(() => {
-    const trimmed = privacyAuditLog.slice(-50)
-    localStorage.setItem("privacy_audit_log", JSON.stringify(trimmed))
-  }, [privacyAuditLog])
-
-  const toggleTrackerBlock = useCallback((exe: string) => {
-    setKnownTrackers((prev) =>
-      prev.map((t) => t.exe === exe ? { ...t, autoBlock: !t.autoBlock } : t)
-    )
-  }, [])
-
-  const clearAuditLog = useCallback(() => {
-    setPrivacyAuditLog([])
-    localStorage.removeItem("privacy_audit_log")
-  }, [])
-
-  // Compute privacy assessments from live processes
-  const computeAssessments = useCallback((): PrivacyAssessment[] => {
-    const trackerMap = new Map(knownTrackers.map(t => [t.exe.toLowerCase(), t]))
-
-    return processes.map((proc) => {
-      const tracker = trackerMap.get(proc.exe.toLowerCase())
-      const reasons: string[] = []
-      let score = 100
-
-      // Factor 1: Connection count (more connections = higher data exfiltration risk)
-      if (proc.connections > 50) { score -= 30; reasons.push(`${proc.connections} active connections — possible data exfiltration`) }
-      else if (proc.connections > 20) { score -= 20; reasons.push(`${proc.connections} active connections — high network activity`) }
-      else if (proc.connections > 5) { score -= 10; reasons.push(`${proc.connections} active connections`) }
-
-      // Factor 2: Known tracking risk
-      if (tracker) {
-        const riskDeductions = { critical: 40, high: 25, medium: 15, low: 5, safe: 0 }
-        score -= riskDeductions[tracker.risk]
-        if (tracker.risk !== "safe") {
-          reasons.push(`Known ${tracker.risk}-risk data collector`)
-        }
-      }
-
-      // Factor 3: Data usage
-      if (proc.sessionData > 500) { score -= 15; reasons.push(`Heavy data usage: ${proc.sessionData.toFixed(0)} MB`) }
-      else if (proc.sessionData > 100 && !tracker) { score -= 5 }
-
-      // Factor 4: Background activity (monitoring status with connections)
-      if (proc.status === "monitoring" && proc.connections > 0 && !tracker) {
-        score -= 5; reasons.push("Background network activity")
-      }
-
-      const risk: PrivacyRisk =
-        score <= 30 ? "critical" :
-          score <= 50 ? "high" :
-            score <= 70 ? "medium" :
-              score <= 85 ? "low" :
-                "safe"
-
-      return {
-        exe: proc.exe,
-        name: proc.name,
-        score: Math.max(0, score),
-        risk,
-        connections: proc.connections,
-        dataMB: proc.sessionData,
-        reasons,
-        blocked: proc.status === "blocked",
-      }
-    }).sort((a, b) => a.score - b.score) // Worst first
-  }, [processes, knownTrackers])
-
-  const [privacyAssessments, setPrivacyAssessments] = useState<PrivacyAssessment[]>([])
-
-  const refreshPrivacyAssessments = useCallback(() => {
-    const assessments = computeAssessments()
-    setPrivacyAssessments(assessments)
-
-    // Add audit entries for newly detected high-risk apps
-    const now = new Date().toLocaleTimeString()
-    setPrivacyAuditLog((prev) => {
-      const newEntries: PrivacyAuditEntry[] = []
-      for (const a of assessments) {
-        if (a.risk === "critical" || a.risk === "high") {
-          // Check if we already have an entry for this app recently
-          const recent = prev.some(
-            e => e.appExe === a.exe && e.risk === a.risk &&
-              e.timestamp.startsWith(now.slice(0, 2)) // same hour
-          )
-          if (!recent) {
-            newEntries.push({
-              timestamp: now,
-              appName: a.name,
-              appExe: a.exe,
-              event: `${a.risk === "critical" ? "CRITICAL" : "HIGH"} privacy risk — ${a.reasons[0] || "excessive data collection"}`,
-              risk: a.risk,
-            })
-          }
-        }
-      }
-      return [...newEntries, ...prev]
-    })
-  }, [computeAssessments])
-
-  // Recompute assessments every poll cycle
-  useEffect(() => {
-    refreshPrivacyAssessments()
-  }, [processes, refreshPrivacyAssessments])
-
-  const overallPrivacyScore = Math.round(
-    privacyAssessments.length > 0
-      ? privacyAssessments.reduce((s, a) => s + a.score, 0) / privacyAssessments.length
-      : 100
-  )
-
   // ── Rules state ───────────────────────────────────────────────────────
   const [rules, setRules] = useState<Rule[]>([])
 
@@ -1362,13 +1157,6 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         addDistractingApp,
         focusHistoryDays,
         clearFocusSessions,
-        knownTrackers,
-        privacyAssessments,
-        privacyAuditLog,
-        overallPrivacyScore,
-        toggleTrackerBlock,
-        refreshPrivacyAssessments,
-        clearAuditLog,
       }}
     >
       {children}
