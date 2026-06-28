@@ -11,7 +11,6 @@ import {
   Crown,
   ArrowUpDown,
   Brain,
-  ShieldAlert,
   Leaf,
   Trees,
   Sprout,
@@ -157,7 +156,7 @@ interface SandboxStatus {
 }
 
 export function Dashboard() {
-  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, privacyAssessments, overallPrivacyScore, budgetSettings, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, thresholdsHitToday } =
+  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, budgetSettings, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, thresholdsHitToday } =
     useShield()
 
   const pct = Math.round((dataBudgetUsed / Math.max(dataBudgetTotal, 1)) * 100)
@@ -486,22 +485,6 @@ export function Dashboard() {
                       🔥 {focusStreak} day streak
                     </p>
                   )}
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Privacy Sentinel */}
-            <Card className="border-border bg-card">
-              <CardContent className="flex items-center gap-3 py-3 px-4">
-                <ShieldAlert className={cn("size-5 shrink-0", overallPrivacyScore <= 50 ? "text-rose-400" : "text-muted-foreground/40")} />
-                <div className="min-w-0">
-                  <p className="text-[11px] text-muted-foreground truncate">Privacy</p>
-                  <p className={cn("text-base font-bold tabular-nums", overallPrivacyScore <= 50 ? "text-rose-400" : "text-muted-foreground/60")}>
-                    {overallPrivacyScore}/100
-                  </p>
-                  <p className="text-[10px] text-muted-foreground/60">
-                    {privacyAssessments.filter(a => a.risk === "critical" || a.risk === "high").length} risky apps
-                  </p>
                 </div>
               </CardContent>
             </Card>
