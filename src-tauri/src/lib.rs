@@ -138,12 +138,15 @@ pub fn run() {
             // When the user clicks the close button, hide the window instead of
             // quitting. The app continues running in the background.
             // The user can fully quit via the tray menu.
-            app.on_window_event(|window, event| {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-            });
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
+            }
 
             // ── Handle --minimized startup flag ─────────────────────────────
             // When launched via autostart with `--minimized`, hide the window

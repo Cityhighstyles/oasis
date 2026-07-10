@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 use crate::carbon::{CarbonTracker, CarbonStats};
 use crate::rules::RulesManager;
 
+// winrt-toast-reborn is a [target.'cfg(windows)'.dependencies] in Cargo.toml,
+// so it must be gated behind cfg(windows) to avoid non-Windows compile errors.
+#[cfg(target_os = "windows")]
+use winrt_toast_reborn::{Toast, ToastManager, Action};
+
 #[cfg(target_os = "windows")]
 use crate::iphelper::{self, ProcessNetStats};
 
@@ -414,6 +419,16 @@ impl NetworkEngine {
                         avg / 1024.0,
                     );
 
+                    // Show native Windows toast notification on its own thread
+                    // to prevent any toast-related panics from killing the polling loop.
+                    #[cfg(target_os = "windows")]
+                    {
+                        let event_for_toast = event.clone();
+                        std::thread::spawn(move || {
+                            show_spike_notification(&event_for_toast);
+                        });
+                    }
+
                     self.spike_events.insert(0, event);
                     if self.spike_events.len() > max_events {
                         self.spike_events.pop();
@@ -653,6 +668,50 @@ pub fn start_polling_task(engine: Arc<Mutex<NetworkEngine>>) {
 }
 
 // ──────────────────────────── utility helpers ────────────────────────────────
+
+// ── Native Windows toast notification for spike events ────────────────────
+
+/// Show a native Windows toast notification when a data spike is detected.
+/// Uses the same `winrt-toast-reborn` crate as the sandbox notifications.
+#[cfg(target_os = "windows")]
+fn show_spike_notification(event: &SpikeEvent) {
+    let manager = ToastManager::new(ToastManager::POWERSHELL_AUM_ID);
+    let mut toast = Toast::new();
+
+    let speed_text = if event.current_speed_bytes >= 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", event.current_speed_bytes / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB/s", event.current_speed_bytes / 1024.0)
+    };
+
+    let avg_speed_text = if event.average_speed_bytes >= 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", event.average_speed_bytes / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB/s", event.average_speed_bytes / 1024.0)
+    };
+
+    let title = format!("🚨 Data Spike: {}", event.name);
+    let body = format!(
+        "{0} is consuming {1} — {2:.1}x its normal rate!\nAverage: {3}",
+        event.name, speed_text, event.ratio, avg_speed_text
+    );
+
+    toast
+        .text1(title)
+        .text2(body)
+        .launch("action=open_spikes")
+        .action(Action::new("View Spikes", "action=open_spikes", ""))
+        .action(Action::new("Dismiss", "action=dismiss", ""));
+
+    if let Err(e) = manager.show(&toast) {
+        log::error!("Failed to show spike toast notification: {:?}", e);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_spike_notification(_event: &SpikeEvent) {
+    // No-op on non-Windows platforms
+}
 
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
