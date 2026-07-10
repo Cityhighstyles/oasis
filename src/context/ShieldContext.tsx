@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react"
 import { toast } from "sonner"
 import { invoke } from "@tauri-apps/api/core"
+import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart"
 
 export type ProcessStatus = "blocked" | "active" | "monitoring"
 
@@ -130,6 +131,32 @@ export interface PerAppBudget {
   autoBlock: boolean
 }
 
+// ── Spike detection types ────────────────────────────────────────────────
+
+export interface SpikeEvent {
+  /** ISO-8601 timestamp */
+  timestamp: string
+  /** PID of the spiking process */
+  pid: number
+  /** Human-readable display name */
+  name: string
+  /** Full executable path */
+  exe: string
+  /** Current transfer speed in bytes/sec */
+  currentSpeedBytes: number
+  /** Rolling average speed in bytes/sec */
+  averageSpeedBytes: number
+  /** Ratio of current speed to average */
+  ratio: number
+}
+
+export interface SpikeSettings {
+  threshold: number
+  minSpeedBytes: number
+  windowSize: number
+  maxEvents: number
+}
+
 /** Snapshot of data usage at a point in time (for timeline charts). */
 export interface DataBudgetSnapshot {
   /** ISO timestamp */
@@ -203,6 +230,19 @@ type ShieldContextType = {
   addRule: (name: string, description: string, risk: string, targets: string[]) => Promise<void>
   /** Delete a rule by id and refresh the list. */
   deleteRule: (id: string) => Promise<void>
+  // ── Spike detection ───────────────────────────────────────────────────
+  spikeEvents: SpikeEvent[]
+  spikeSettings: SpikeSettings
+  refreshSpikeEvents: () => Promise<void>
+  clearSpikeEvents: () => Promise<void>
+  setSpikeThreshold: (threshold: number) => Promise<void>
+  setSpikeMinSpeed: (minSpeedBytes: number) => Promise<void>
+  refreshSpikeSettings: () => Promise<void>
+  // ── Autostart ─────────────────────────────────────────────────────────
+  isAutostartEnabled: boolean
+  autostartLoading: boolean
+  toggleAutostart: () => Promise<void>
+  refreshAutostartStatus: () => Promise<void>
   // ── Carbon tracking ────────────────────────────────────────────────────
   carbonStats: CarbonStats
   refreshCarbonStats: () => Promise<void>
@@ -239,6 +279,94 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   const [wfpAvailable, setWfpAvailable] = useState(false)
   const [processes, setProcesses] = useState<ProcessEntry[]>([])
   const [suspendedPids, setSuspendedPids] = useState<Set<number>>(new Set())
+
+  // ── Spike detection state ──────────────────────────────────────────────
+  const [spikeEvents, setSpikeEvents] = useState<SpikeEvent[]>([])
+  const [spikeSettings, setSpikeSettings] = useState<SpikeSettings>({
+    threshold: 3.0,
+    minSpeedBytes: 102400,
+    windowSize: 6,
+    maxEvents: 100,
+  })
+
+  const refreshSpikeEvents = useCallback(async () => {
+    try {
+      const data: SpikeEvent[] = await invoke("get_spike_events")
+      setSpikeEvents(data)
+    } catch (err) {
+      console.error("Failed to fetch spike events:", err)
+    }
+  }, [])
+
+  const clearSpikeEvents = useCallback(async () => {
+    try {
+      await invoke("clear_spike_events")
+      setSpikeEvents([])
+      lastSpikeCountRef.current = 0
+    } catch (err) {
+      console.error("Failed to clear spike events:", err)
+    }
+  }, [])
+
+  const refreshSpikeSettings = useCallback(async () => {
+    try {
+      const data: SpikeSettings = await invoke("get_spike_settings")
+      setSpikeSettings(data)
+    } catch (err) {
+      console.error("Failed to fetch spike settings:", err)
+    }
+  }, [])
+
+  const setSpikeThreshold = useCallback(async (threshold: number) => {
+    try {
+      await invoke("set_spike_threshold", { threshold })
+      setSpikeSettings((prev) => ({ ...prev, threshold }))
+    } catch (err) {
+      console.error("Failed to set spike threshold:", err)
+    }
+  }, [])
+
+  const setSpikeMinSpeed = useCallback(async (minSpeedBytes: number) => {
+    try {
+      await invoke("set_spike_min_speed", { minSpeedBytes })
+      setSpikeSettings((prev) => ({ ...prev, minSpeedBytes }))
+    } catch (err) {
+      console.error("Failed to set spike min speed:", err)
+    }
+  }, [])
+
+  // ── Autostart state ────────────────────────────────────────────────────
+  const [isAutostartEnabled, setIsAutostartEnabled] = useState(false)
+  const [autostartLoading, setAutostartLoading] = useState(false)
+
+  const refreshAutostartStatus = useCallback(async () => {
+    try {
+      const enabled = await isAutostartEnabled()
+      setIsAutostartEnabled(enabled)
+    } catch (err) {
+      console.error("Failed to check autostart status:", err)
+    }
+  }, [])
+
+  const toggleAutostart = useCallback(async () => {
+    setAutostartLoading(true)
+    try {
+      if (isAutostartEnabled) {
+        await disableAutostart()
+        setIsAutostartEnabled(false)
+      } else {
+        await enableAutostart()
+        setIsAutostartEnabled(true)
+      }
+    } catch (err) {
+      console.error("Failed to toggle autostart:", err)
+      toast.error("Failed to toggle autostart", {
+        description: String(err),
+      })
+    } finally {
+      setAutostartLoading(false)
+    }
+  }, [isAutostartEnabled])
 
   // ── Carbon state ──────────────────────────────────────────────────────
   const [carbonStats, setCarbonStats] = useState<CarbonStats>({
@@ -1075,12 +1203,38 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     }
   }, [isShieldActive, refreshSuspendedPids])
 
+  // ── Spike notification polling ─────────────────────────────────────────
+  // Polls for new spike events every 5 seconds and shows toast notifications
+  const lastSpikeCountRef = useRef(0)
+  useEffect(() => {
+    if (spikeEvents.length > lastSpikeCountRef.current) {
+      // New spikes detected — show notification for each new one
+      const newSpikes = spikeEvents.slice(0, spikeEvents.length - lastSpikeCountRef.current)
+      for (const spike of newSpikes) {
+        const speedMBs = (spike.currentSpeedBytes / (1024 * 1024)).toFixed(1)
+        const avgMBs = (spike.averageSpeedBytes / (1024 * 1024)).toFixed(2)
+        toast.error(`Data Spike: ${spike.name}`, {
+          description: `${spike.name} is consuming ${speedMBs} MB/s — that's ${spike.ratio.toFixed(1)}x its normal rate (avg ${avgMBs} MB/s)`,
+          duration: 8000,
+          action: {
+            label: "View",
+            onClick: () => { window.location.href = "/monitor"; },
+          },
+        })
+      }
+    }
+    lastSpikeCountRef.current = spikeEvents.length
+  }, [spikeEvents])
+
   useEffect(() => {
     refreshWfpStatus()
     refreshProcesses()
     refreshSuspendedPids()
     refreshRules()
     refreshCarbonStats()
+    refreshSpikeEvents()
+    refreshSpikeSettings()
+    refreshAutostartStatus()
 
     const interval = setInterval(() => {
       refreshProcesses()
@@ -1090,11 +1244,16 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       refreshCarbonStats()
     }, 5000)
 
+    const spikeInterval = setInterval(() => {
+      refreshSpikeEvents()
+    }, 5000)
+
     return () => {
       clearInterval(interval)
       clearInterval(carbonInterval)
+      clearInterval(spikeInterval)
     }
-  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids, refreshRules, refreshCarbonStats])
+  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids, refreshRules, refreshCarbonStats, refreshSpikeEvents, refreshSpikeSettings, refreshAutostartStatus])
 
   const blockedCount = processes.filter((p) => p.status === "blocked").length
   const blockedApps = processes.filter((p) => p.status === "blocked")
@@ -1157,6 +1316,19 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         addDistractingApp,
         focusHistoryDays,
         clearFocusSessions,
+        // ── Spike detection ────────────────────────────────────────────
+        spikeEvents,
+        spikeSettings,
+        refreshSpikeEvents,
+        clearSpikeEvents,
+        setSpikeThreshold,
+        setSpikeMinSpeed,
+        refreshSpikeSettings,
+        // ── Autostart ─────────────────────────────────────────────────
+        isAutostartEnabled,
+        autostartLoading,
+        toggleAutostart,
+        refreshAutostartStatus,
       }}
     >
       {children}

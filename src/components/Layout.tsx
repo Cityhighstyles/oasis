@@ -10,9 +10,13 @@ import {
   Gauge,
   Shield,
   ShieldOff,
-  Wifi,
   ChevronRight,
   PauseCircle,
+  Monitor,
+  LogIn,
+  Loader2,
+  Bell,
+  Zap,
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
@@ -38,10 +42,19 @@ const NAV_ITEMS = [
   { to: "/rules", icon: SlidersHorizontal, label: "Rules & Controls" },
   { to: "/monitor", icon: Activity, label: "Live Monitor" },
   { to: "/sandbox", icon: FlaskConical, label: "Dev Sandbox" },
+  { to: "/spikes", icon: Zap, label: "Spike Log" },
 ]
 
 export function Layout() {
-  const { isShieldActive, toggleShield, suspendedPids } = useShield()
+  const {
+    isShieldActive,
+    toggleShield,
+    suspendedPids,
+    spikeEvents,
+    isAutostartEnabled,
+    autostartLoading,
+    toggleAutostart,
+  } = useShield()
   const [shieldConfirmOpen, setShieldConfirmOpen] = useState(false)
 
   const handleShieldToggle = useCallback(
@@ -114,6 +127,12 @@ export function Layout() {
                 <>
                   <Icon className={cn("size-4 shrink-0", isActive ? "text-neon-emerald" : "")} />
                   <span className="flex-1">{label}</span>
+                  {/* Spike badge on Live Monitor */}
+                  {to === "/monitor" && spikeEvents.length > 0 && !isActive && (
+                    <Badge className="text-[8px] h-4 px-1 min-w-4 bg-destructive/20 text-destructive border-destructive/30">
+                      {spikeEvents.length}
+                    </Badge>
+                  )}
                   {isActive && (
                     <ChevronRight className="size-3 text-neon-emerald/60" />
                   )}
@@ -123,15 +142,56 @@ export function Layout() {
           ))}
         </nav>
 
-        {/* Bottom status */}
-        <div className="border-t border-border px-5 py-4">
-          <div className="flex items-center gap-2 mb-1">
-            <Wifi className="size-3 text-muted-foreground" />
-            <span className="text-xs text-muted-foreground">Hotspot Active</span>
+        {/* Bottom section — Autostart + Background status */}
+        <div className="border-t border-border px-4 py-3 space-y-3">
+          {/* Background running indicator */}
+          <div className="flex items-center gap-2">
+            <div className="size-1.5 rounded-full bg-neon-emerald animate-pulse" />
+            <span className="text-[10px] text-muted-foreground font-medium">
+              Running in Background
+            </span>
           </div>
-          <p className="text-[10px] text-muted-foreground/60">
-            AT&T Hotspot — 4G LTE
-          </p>
+
+          {/* Autostart toggle */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 min-w-0">
+              <LogIn className="size-3 text-muted-foreground shrink-0" />
+              <span className="text-[10px] text-muted-foreground truncate">
+                Launch on Startup
+              </span>
+            </div>
+            <button
+              onClick={toggleAutostart}
+              disabled={autostartLoading}
+              className={cn(
+                "relative inline-flex h-4 w-7 items-center rounded-full transition-colors duration-200",
+                autostartLoading ? "opacity-50 cursor-wait" :
+                isAutostartEnabled ? "bg-neon-emerald" : "bg-muted-foreground/30"
+              )}
+            >
+              {autostartLoading ? (
+                <Loader2 className="size-3 text-muted-foreground animate-spin mx-auto" />
+              ) : (
+                <span
+                  className={cn(
+                    "inline-block size-3 rounded-full bg-white shadow-sm transition-transform duration-200",
+                    isAutostartEnabled ? "translate-x-[15px]" : "translate-x-[2px]"
+                  )}
+                />
+              )}
+            </button>
+          </div>
+
+          {/* Spike alert count — clickable to navigate */}
+          {spikeEvents.length > 0 && (
+            <NavLink
+              to="/spikes"
+              className="flex items-center gap-2 text-[10px] text-destructive hover:text-destructive/80 transition-colors"
+            >
+              <Bell className="size-3" />
+              <span>{spikeEvents.length} data spike{spikeEvents.length !== 1 ? "s" : ""}</span>
+            </NavLink>
+          )}
         </div>
       </aside>
 
@@ -151,6 +211,16 @@ export function Layout() {
             <span className="text-xs font-medium text-muted-foreground uppercase tracking-widest">
               System Status
             </span>
+            {/* Spike warning indicator */}
+            {spikeEvents.length > 0 && (
+              <Badge
+                variant="outline"
+                className="ml-2 text-[9px] h-5 gap-1 border-destructive/30 text-destructive bg-destructive/5 animate-pulse"
+              >
+                <Bell className="size-2.5" />
+                {spikeEvents.length} spike{spikeEvents.length !== 1 ? "s" : ""}
+              </Badge>
+            )}
           </div>
 
           {/* Master Shield Toggle */}

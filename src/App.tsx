@@ -8,6 +8,7 @@ import { DevSandbox } from "@/pages/DevSandbox"
 import { Focus } from "@/pages/Focus"
 import { Climate } from "@/pages/Climate"
 import { DataBudget } from "@/pages/DataBudget"
+import { SpikeLog } from "@/pages/SpikeLog"
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
             <Route path="/rules" element={<RulesControls />} />
             <Route path="/monitor" element={<LiveMonitor />} />
             <Route path="/sandbox" element={<DevSandbox />} />
+            <Route path="/spikes" element={<SpikeLog />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

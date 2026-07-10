@@ -9,7 +9,7 @@ use tauri::State;
 #[cfg(target_os = "windows")]
 use crate::procctl;
 use crate::carbon::CarbonStats;
-use crate::engine::{NetworkEngine, ProcessEntry};
+use crate::engine::{NetworkEngine, ProcessEntry, SpikeEvent, SpikeSettings};
 use crate::rules::Rule;
 use crate::sandbox::{CommandType, DetectedOperation, SandboxEngine};
 use serde::{Deserialize, Serialize};
@@ -378,6 +378,74 @@ pub fn get_sandbox_status(
         has_groq_key: engine.has_groq_key(),
         operations_count: engine.detected_operations.len(),
     })
+}
+
+// ═══════════════════════════════ Spike Detection Commands ═══════════════════
+
+/// Returns the list of recent data spike events (newest first).
+/// The frontend polls this at intervals and displays toast notifications.
+#[tauri::command]
+pub fn get_spike_events(
+    state: State<'_, AppState>,
+) -> Result<Vec<SpikeEvent>, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    Ok(engine.get_spike_events())
+}
+
+/// Clear all stored spike events (e.g. after user dismisses them).
+#[tauri::command]
+pub fn clear_spike_events(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.clear_spike_events();
+    Ok(())
+}
+
+/// Returns the current spike detection settings.
+#[tauri::command]
+pub fn get_spike_settings(
+    state: State<'_, AppState>,
+) -> Result<SpikeSettings, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    Ok(engine.get_spike_settings())
+}
+
+/// Update the spike detection threshold multiplier (min 1.5, max 50.0).
+#[tauri::command]
+pub fn set_spike_threshold(
+    threshold: f64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.set_spike_threshold(threshold);
+    Ok(())
+}
+
+/// Update the minimum speed (bytes/sec) required to trigger a spike alert.
+#[tauri::command]
+pub fn set_spike_min_speed(
+    min_speed_bytes: f64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.set_spike_min_speed(min_speed_bytes);
+    Ok(())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

@@ -74,6 +74,58 @@ mod stub {
 #[cfg(not(target_os = "windows"))]
 use stub::{WfpEngine, iphelper, ProcessNetStats};
 
+// ──────────────────── spike detection types ──────────────────────────────────
+
+/// A detected network traffic spike event emitted when a process suddenly
+/// starts consuming significantly more data than its recent average.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpikeEvent {
+    /// ISO-8601 timestamp when the spike was detected.
+    pub timestamp: String,
+    /// PID of the spiking process.
+    pub pid: u32,
+    /// Human-readable display name of the process.
+    pub name: String,
+    /// Full executable path.
+    pub exe: String,
+    /// Current transfer speed in bytes/sec.
+    pub current_speed_bytes: f64,
+    /// Rolling average speed in bytes/sec (over last N samples).
+    pub average_speed_bytes: f64,
+    /// Ratio of current speed to average (e.g. 5.0 = 5x spike).
+    pub ratio: f64,
+}
+
+/// Configurable parameters for the spike detection algorithm.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpikeSettings {
+    /// Multiplier above the rolling average that triggers a spike alert.
+    /// Default: 3.0 (current speed must be >= 3x the average).
+    pub threshold: f64,
+    /// Minimum speed in bytes/sec below which a spike is never emitted.
+    /// This prevents false alerts from very low-traffic processes.
+    /// Default: 102_400 (100 KB/s).
+    pub min_speed_bytes: f64,
+    /// Number of recent speed samples to keep in the rolling window.
+    /// Default: 6 (covers 12 seconds at 2-second poll interval).
+    pub window_size: usize,
+    /// Maximum number of spike events to retain in memory.
+    pub max_events: usize,
+}
+
+impl Default for SpikeSettings {
+    fn default() -> Self {
+        SpikeSettings {
+            threshold: 3.0,
+            min_speed_bytes: 102_400.0,  // 100 KB/s
+            window_size: 6,
+            max_events: 100,
+        }
+    }
+}
+
 // ──────────────────────────── data contract ──────────────────────────────────
 
 /// Serialized shape sent to the TypeScript front-end.
@@ -134,6 +186,15 @@ pub struct NetworkEngine {
     pub suspended_pids: std::collections::HashSet<u32>,
     /// Tracks cumulative carbon impact of network activity.
     pub carbon_tracker: CarbonTracker,
+    /// Per-PID speed history (rolling window of recent speed samples).
+    pid_speed_history: HashMap<u32, Vec<f64>>,
+    /// Recent data spike events (newest first, capped at max_events).
+    spike_events: Vec<SpikeEvent>,
+    /// Spikes that the frontend has already been notified about via polling.
+    /// Keyed by a composite string "pid:timestamp" to avoid duplicates.
+    acknowledged_spikes: HashSet<String>,
+    /// Configurable spike detection parameters.
+    spike_settings: SpikeSettings,
 }
 
 impl NetworkEngine {
@@ -151,6 +212,10 @@ impl NetworkEngine {
             #[cfg(target_os = "windows")]
             suspended_pids: std::collections::HashSet::new(),
             carbon_tracker: CarbonTracker::new(),
+            pid_speed_history: HashMap::new(),
+            spike_events: Vec::new(),
+            acknowledged_spikes: HashSet::new(),
+            spike_settings: SpikeSettings::default(),
         }
     }
 
@@ -243,6 +308,119 @@ impl NetworkEngine {
     /// Reset the carbon tracker (e.g. on user request).
     pub fn reset_carbon_tracker(&mut self) {
         self.carbon_tracker.reset();
+    }
+
+    // ── Spike detection API ────────────────────────────────────────────────
+
+    /// Return all recent spike events (newest first).
+    pub fn get_spike_events(&self) -> Vec<SpikeEvent> {
+        self.spike_events.clone()
+    }
+
+    /// Get the current spike detection settings.
+    pub fn get_spike_settings(&self) -> SpikeSettings {
+        self.spike_settings.clone()
+    }
+
+    /// Update the spike detection threshold multiplier.
+    pub fn set_spike_threshold(&mut self, threshold: f64) {
+        let clamped = threshold.max(1.5).min(50.0);
+        self.spike_settings.threshold = clamped;
+        log::info!("Spike detection threshold set to {}", clamped);
+    }
+
+    /// Update the minimum speed (bytes/sec) required to trigger a spike alert.
+    pub fn set_spike_min_speed(&mut self, min_speed: f64) {
+        let clamped = min_speed.max(1024.0).min(1_000_000_000.0); // 1 KB/s .. 1 GB/s
+        self.spike_settings.min_speed_bytes = clamped;
+        log::info!("Spike detection min speed set to {} B/s", clamped);
+    }
+
+    /// Clear all stored spike events.
+    pub fn clear_spike_events(&mut self) {
+        self.spike_events.clear();
+        self.acknowledged_spikes.clear();
+    }
+
+    /// Check for data spikes by comparing each PID's current speed against
+    /// its rolling average. Called at the end of each poll cycle.
+    fn detect_spikes(&mut self, new_entries: &[ProcessEntry]) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let settings = &self.spike_settings;
+        let max_events = settings.max_events;
+
+        for entry in new_entries {
+            let pid = entry.pid;
+            if pid == 0 || entry.speed <= 0.0 {
+                continue;
+            }
+
+            // Skip if the process is blocked (very low speed expected)
+            if entry.status == "blocked" {
+                continue;
+            }
+
+            // Update rolling speed history
+            let history = self
+                .pid_speed_history
+                .entry(pid)
+                .or_default();
+
+            history.push(entry.speed);
+            if history.len() > settings.window_size {
+                history.remove(0);
+            }
+
+            // Need at least 3 samples to compute a meaningful average
+            if history.len() < 3 {
+                continue;
+            }
+
+            let avg: f64 = history.iter().sum::<f64>() / history.len() as f64;
+
+            // Minimum speed threshold — don't alert on very low traffic
+            if entry.speed < settings.min_speed_bytes && avg < settings.min_speed_bytes {
+                continue;
+            }
+
+            if avg <= 0.0 {
+                continue;
+            }
+
+            let ratio = entry.speed / avg;
+
+            // Only emit a spike if the ratio exceeds the configured threshold
+            if ratio >= settings.threshold {
+                // Create a dedup key to avoid duplicate events for the same spike
+                let dedup_key = format!("{}:{}", pid, now);
+
+                if !self.acknowledged_spikes.contains(&dedup_key) {
+                    self.acknowledged_spikes.insert(dedup_key);
+
+                    let event = SpikeEvent {
+                        timestamp: now.clone(),
+                        pid,
+                        name: entry.name.clone(),
+                        exe: entry.exe.clone(),
+                        current_speed_bytes: entry.speed,
+                        average_speed_bytes: avg,
+                        ratio,
+                    };
+
+                    log::info!(
+                        "SPIKE DETECTED: {} (PID {}) — {:.1}x avg ({:.1} KB/s vs {:.1} KB/s avg)",
+                        entry.name, pid, ratio,
+                        entry.speed / 1024.0,
+                        avg / 1024.0,
+                    );
+
+                    self.spike_events.insert(0, event);
+                    if self.spike_events.len() > max_events {
+                        self.spike_events.pop();
+                    }
+                }
+            }
+        }
     }
 
     /// Perform one full telemetry poll and update `self.entries`.
@@ -447,6 +625,9 @@ impl NetworkEngine {
                 .partial_cmp(&a.session_data)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // 8. Detect data spikes before finalising the entries
+        self.detect_spikes(&new_entries);
 
         self.entries = new_entries;
     }
