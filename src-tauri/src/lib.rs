@@ -19,6 +19,9 @@ pub mod iphelper;
 #[cfg(target_os = "windows")]
 pub mod procctl;
 
+#[cfg(target_os = "windows")]
+pub mod pdh;
+
 pub mod carbon;
 pub mod engine;
 pub mod commands;
@@ -52,7 +55,7 @@ pub fn run() {
     // ── Initialise WFP (attempt; non-fatal on permission deny) ───────────────
     {
         if let Ok(mut eng) = engine.lock() {
-            eng.init_wfp();
+            eng.init_wfp_and_ndis();
         }
     }
 
@@ -166,6 +169,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_live_processes,
             commands::toggle_process_shield,
+            commands::get_total_throughput,
             commands::get_wfp_status,
             commands::get_blocked_apps,
             commands::suspend_process,

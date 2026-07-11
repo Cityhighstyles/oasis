@@ -67,6 +67,24 @@ pub fn toggle_process_shield(
     }
 }
 
+/// Returns the current total network interface throughput from NDIS miniport drivers.
+/// Returns `{ bytesReceivedPerSec, bytesSentPerSec }` aggregated across all adapters.
+/// This is the same data source as the Task Manager Performance tab.
+#[tauri::command]
+pub fn get_total_throughput(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let engine = state
+        .0
+        .lock()
+        .map_err(|e| format!("state lock poisoned: {e}"))?;
+    let (recv, send) = engine.get_total_throughput();
+    Ok(serde_json::json!({
+        "bytesReceivedPerSec": recv,
+        "bytesSentPerSec": send,
+    }))
+}
+
 /// Returns whether the WFP engine session is currently open.
 #[tauri::command]
 pub fn get_wfp_status(state: State<'_, AppState>) -> bool {

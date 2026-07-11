@@ -184,11 +184,18 @@ const DEFAULT_BUDGET_SETTINGS: DataBudgetSettings = {
   customAlertMB: 0,
 }
 
+/** Total NDIS-level network interface throughput (Task Manager Performance tab style). */
+export interface TotalThroughput {
+  bytesReceivedPerSec: number
+  bytesSentPerSec: number
+}
+
 type ShieldContextType = {
   isShieldActive: boolean
   toggleShield: () => void
   dataBudgetUsed: number
   dataBudgetTotal: number
+  totalThroughput: TotalThroughput
   // ── Data Budget settings ──────────────────────────────────────────
   budgetSettings: DataBudgetSettings
   dailyUsedMB: number
@@ -805,6 +812,21 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
   })
 
   // Track which thresholds we've already notified about today
+  // ── Total NDIS throughput state ───────────────────────────────────────
+  const [totalThroughput, setTotalThroughput] = useState<TotalThroughput>({
+    bytesReceivedPerSec: 0,
+    bytesSentPerSec: 0,
+  })
+
+  const refreshTotalThroughput = useCallback(async () => {
+    try {
+      const data: TotalThroughput = await invoke("get_total_throughput")
+      setTotalThroughput(data)
+    } catch (err) {
+      console.error("Failed to fetch total throughput:", err)
+    }
+  }, [])
+
   const [thresholdsHitToday, setThresholdsHitToday] = useState<number[]>(() => {
     try {
       const saved = localStorage.getItem("budget_thresholds_hit")
@@ -1235,6 +1257,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     refreshSpikeEvents()
     refreshSpikeSettings()
     refreshAutostartStatus()
+    refreshTotalThroughput()
 
     const interval = setInterval(() => {
       refreshProcesses()
@@ -1248,10 +1271,15 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       refreshSpikeEvents()
     }, 5000)
 
+    const throughputInterval = setInterval(() => {
+      refreshTotalThroughput()
+    }, 2000)
+
     return () => {
       clearInterval(interval)
       clearInterval(carbonInterval)
       clearInterval(spikeInterval)
+      clearInterval(throughputInterval)
     }
   }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids, refreshRules, refreshCarbonStats, refreshSpikeEvents, refreshSpikeSettings, refreshAutostartStatus])
 
@@ -1265,6 +1293,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
         toggleShield,
         dataBudgetUsed,
         dataBudgetTotal,
+        totalThroughput,
         budgetSettings,
         dailyUsedMB,
         weeklyUsedMB,

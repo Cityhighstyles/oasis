@@ -156,7 +156,7 @@ interface SandboxStatus {
 }
 
 export function Dashboard() {
-  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, budgetSettings, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, thresholdsHitToday } =
+  const { isShieldActive, dataBudgetUsed, dataBudgetTotal, totalThroughput, firewallStatus, wfpAvailable, blockedCount, blockedApps, processes, rules, carbonStats, resetCarbonTracker, isFocusMode, todayFocusMinutes, focusStreak, budgetSettings, dailyUsedMB, weeklyUsedMB, monthlyUsedMB, thresholdsHitToday } =
     useShield()
 
   const pct = Math.round((dataBudgetUsed / Math.max(dataBudgetTotal, 1)) * 100)
@@ -436,17 +436,17 @@ export function Dashboard() {
 
           {/* Quick stats row: Speed, Rules, Sandbox, Active */}
           <div className="col-span-2 grid grid-cols-4 gap-3">
-            {/* Speed Gauge */}
+            {/* Total NDIS Interface Throughput */}
             <Card className="border-border bg-card">
               <CardContent className="flex items-center gap-3 py-3 px-4">
-                <Gauge className={cn("size-5 shrink-0", totalSpeed > 1024 * 1024 ? "text-destructive" : totalSpeed > 0 ? "text-neon-emerald" : "text-muted-foreground/40")} />
+                <Gauge className={cn("size-5 shrink-0", totalThroughput.bytesReceivedPerSec > 1024 * 1024 ? "text-neon-cyan" : totalThroughput.bytesReceivedPerSec > 0 ? "text-neon-emerald" : "text-muted-foreground/40")} />
                 <div className="min-w-0">
-                  <p className="text-[11px] text-muted-foreground truncate">Bandwidth</p>
-                  <p className={cn("text-base font-bold tabular-nums", totalSpeed > 0 ? "text-neon-emerald" : "text-muted-foreground/60")}>
-                    {formatSpeed(totalSpeed)}
+                  <p className="text-[11px] text-muted-foreground truncate">Interface</p>
+                  <p className={cn("text-base font-bold tabular-nums", totalThroughput.bytesReceivedPerSec > 0 ? "text-neon-cyan" : "text-muted-foreground/60")}>
+                    {formatSpeed(totalThroughput.bytesReceivedPerSec)}
                   </p>
                   <p className="text-[10px] text-muted-foreground/60">
-                    {totalSpeed > 0 ? "active throughput" : "idle"}
+                    NDIS miniport driver — Task Manager style
                   </p>
                 </div>
               </CardContent>

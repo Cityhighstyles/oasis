@@ -25,6 +25,12 @@ use crate::carbon::{CarbonTracker, CarbonStats};
 use crate::rules::RulesManager;
 
 #[cfg(target_os = "windows")]
+use crate::pdh::InterfaceThroughput;
+
+#[cfg(not(target_os = "windows"))]
+pub struct InterfaceThroughput;
+
+#[cfg(target_os = "windows")]
 use crate::iphelper::{self, ProcessNetStats};
 
 // winrt-toast-reborn is a [target.'cfg(windows)'.dependencies] in Cargo.toml,
@@ -58,6 +64,12 @@ mod stub {
         pub fn blocked_paths(&self) -> Vec<String> { vec![] }
     }
 
+    pub struct InterfaceThroughput;
+    impl InterfaceThroughput {
+        pub fn new() -> Result<Self, String> { Err("PDH not available on this platform".into()) }
+        pub fn collect(&self) -> Result<(f64, f64), String> { Err("PDH not available on this platform".into()) }
+    }
+
     // Stub fallback version for non-Windows architectures
     #[derive(Clone, Debug, Default)]
     pub struct ProcessNetStats {
@@ -77,7 +89,7 @@ mod stub {
 }
 
 #[cfg(not(target_os = "windows"))]
-use stub::{WfpEngine, iphelper, ProcessNetStats};
+use stub::{WfpEngine, iphelper, ProcessNetStats, InterfaceThroughput};
 
 // ──────────────────── spike detection types ──────────────────────────────────
 
@@ -203,6 +215,13 @@ pub struct NetworkEngine {
     acknowledged_spikes: HashSet<String>,
     /// Configurable spike detection parameters.
     spike_settings: SpikeSettings,
+    /// NDIS-level network interface throughput via PDH performance counters.
+    /// `(bytes_received_per_sec, bytes_sent_per_sec)` — total across all adapters.
+    /// This is the same data source as the Task Manager Performance tab.
+    total_throughput: (f64, f64),
+    /// PDH performance counter reader for NDIS miniport driver throughput.
+    #[cfg(target_os = "windows")]
+    ndis_throughput: Option<InterfaceThroughput>,
 }
 
 impl NetworkEngine {
@@ -226,6 +245,9 @@ impl NetworkEngine {
             spike_events: Vec::new(),
             acknowledged_spikes: HashSet::new(),
             spike_settings: SpikeSettings::default(),
+            total_throughput: (0.0, 0.0),
+            #[cfg(target_os = "windows")]
+            ndis_throughput: None,
         }
     }
 
@@ -298,16 +320,47 @@ impl NetworkEngine {
 
     /// Attempt to open the WFP BFE session.  Non-fatal on failure — the engine
     /// will still provide telemetry data; blocking/unblocking will return errors.
-    pub fn init_wfp(&mut self) {
+    pub fn init_wfp_and_ndis(&mut self) {
         match self.wfp.open() {
             Ok(()) => log::info!("WFP engine session opened successfully"),
             Err(e) => log::warn!("WFP engine session failed to open (non-fatal): {e}"),
+        }
+
+        // Initialize NDIS performance counters for total interface throughput.
+        // Uses PDH to read the same counters as the Task Manager Performance tab.
+        // Non-fatal: if PDH fails, we simply report 0 throughput.
+        self.init_ndis_throughput();
+    }
+
+    /// Initialize the PDH-based NDIS throughput reader.
+    /// Reads total network interface bytes/sec from miniport driver counters.
+    fn init_ndis_throughput(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            match InterfaceThroughput::new() {
+                Ok(tp) => {
+                    log::info!("NDIS throughput reader initialized via PDH");
+                    self.ndis_throughput = Some(tp);
+                }
+                Err(e) => {
+                    log::warn!("NDIS throughput reader init failed (non-fatal): {e}");
+                }
+            }
         }
     }
 
     /// Clone the current process entry snapshot for the Tauri command handler.
     pub fn get_entries(&self) -> Vec<ProcessEntry> {
         self.entries.clone()
+    }
+
+    /// Return the current total network interface throughput.
+    /// Returns `(bytes_received_per_sec, bytes_sent_per_sec)`.
+    /// This is the aggregate across all network adapters, read from NDIS
+    /// miniport driver performance counters — the same data as the
+    /// Task Manager Performance tab's network graph.
+    pub fn get_total_throughput(&self) -> (f64, f64) {
+        self.total_throughput
     }
 
     /// Return a snapshot of current carbon statistics.
@@ -480,7 +533,25 @@ impl NetworkEngine {
             let _ = &stats_map;
         }
 
-        // 2. Add UDP connection counts to the same map
+        // 2. Poll NDIS miniport driver throughput via PDH performance counters.
+        //    This gives us the total interface bandwidth consumed at the hardware level,
+        //    just like the Task Manager Performance tab's network graph.
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref tp) = self.ndis_throughput {
+                match tp.collect() {
+                    Ok((recv, send)) => {
+                        self.total_throughput = (recv, send);
+                    }
+                    Err(e) => {
+                        log::warn!("NDIS throughput collect failed: {e}");
+                        self.total_throughput = (0.0, 0.0);
+                    }
+                }
+            }
+        }
+
+        // 3. Add UDP connection counts to the same map
         iphelper::collect_udp_counts(&mut stats_map);
 
         // 3. Track bytes per PID.

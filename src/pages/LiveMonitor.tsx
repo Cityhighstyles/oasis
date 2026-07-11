@@ -34,7 +34,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
-import { useShield, type ProcessStatus, type ProcessEntry } from "@/context/ShieldContext"
+import { useShield, type ProcessStatus, type ProcessEntry, type TotalThroughput } from "@/context/ShieldContext"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 
@@ -370,7 +370,7 @@ function PidSubRow({ proc, isOperating, wfpAvailable, isSuspended, onSuspend, on
 // ──────────────────────────── main component ─────────────────────────
 
 export function LiveMonitor() {
-  const { isShieldActive, processes, refreshProcesses, wfpAvailable, suspendProcess, resumeProcess, killProcess, suspendedPids } = useShield()
+  const { isShieldActive, processes, refreshProcesses, wfpAvailable, suspendProcess, resumeProcess, killProcess, suspendedPids, totalThroughput } = useShield()
   const [loading, setLoading] = useState<boolean>(true)
   const [search, setSearch] = useState("")
   const [sortField, setSortField] = useState<SortKey>("sessionData")
@@ -697,7 +697,7 @@ export function LiveMonitor() {
       </div>
 
       {/* Stats bar */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-5 gap-3">
         {[
           { label: "Applications", value: groups.length, color: "text-foreground" },
           { label: "Active", value: active, color: "text-neon-emerald" },
@@ -715,6 +715,21 @@ export function LiveMonitor() {
             <p className={cn("text-xl font-bold tabular-nums", color)}>{value}</p>
           </div>
         ))}
+        {/* NDIS Interface Throughput — Task Manager Performance tab style */}
+        <div className="rounded-lg border border-neon-cyan/20 bg-neon-cyan/5 px-4 py-3">
+          <p className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 flex items-center gap-1">
+            <span className="size-1.5 rounded-full bg-neon-cyan animate-pulse" />
+            Interface Throughput
+          </p>
+          <p className="text-lg font-bold tabular-nums text-neon-cyan">
+            {totalThroughput.bytesReceivedPerSec > 0
+              ? formatSpeed(totalThroughput.bytesReceivedPerSec)
+              : "—"}
+          </p>
+          <p className="text-[9px] text-muted-foreground/50 mt-0.5">
+            NDIS miniport / {formatSpeed(totalThroughput.bytesSentPerSec)} sent
+          </p>
+        </div>
       </div>
 
       {/* Table */}
