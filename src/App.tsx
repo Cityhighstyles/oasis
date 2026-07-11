@@ -7,6 +7,7 @@ import { LiveMonitor } from "@/pages/LiveMonitor"
 import { DevSandbox } from "@/pages/DevSandbox"
 import { Focus } from "@/pages/Focus"
 import { Climate } from "@/pages/Climate"
+import { InterfaceThroughput } from "@/pages/InterfaceThroughput"
 import { DataBudget } from "@/pages/DataBudget"
 import { SpikeLog } from "@/pages/SpikeLog"
 
@@ -24,6 +25,7 @@ export default function App() {
             <Route path="/monitor" element={<LiveMonitor />} />
             <Route path="/sandbox" element={<DevSandbox />} />
             <Route path="/spikes" element={<SpikeLog />} />
+            <Route path="/throughput" element={<InterfaceThroughput />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

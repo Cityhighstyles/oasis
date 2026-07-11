@@ -40,7 +40,8 @@ const NAV_ITEMS = [
   { to: "/budget", icon: Gauge, label: "Data Budget" },
   { to: "/focus", icon: Brain, label: "Digital Wellness" },
   { to: "/rules", icon: SlidersHorizontal, label: "Rules & Controls" },
-  { to: "/monitor", icon: Activity, label: "Live Monitor" },
+  { to: "/throughput", icon: Activity, label: "Throughput" },
+  { to: "/monitor", icon: Monitor, label: "Live Monitor" },
   { to: "/sandbox", icon: FlaskConical, label: "Dev Sandbox" },
   { to: "/spikes", icon: Zap, label: "Spike Log" },
 ]

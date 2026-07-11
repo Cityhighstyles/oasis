@@ -78,6 +78,16 @@ extern "system" {
 /// This is the same data that the Task Manager Wi-Fi/Ethernet performance
 /// graph displays — total bytes per second for the entire system, without
 /// per-process attribution.
+///
+/// # Thread safety
+///
+/// `InterfaceThroughput` holds raw PDH handles (`*mut c_void`), which do not
+/// implement `Send` / `Sync` automatically. However, in practice:
+///   - All PDH calls are made from behind the `NetworkEngine` mutex
+///   - No two threads access the same PDH query concurrently
+///   - The PDH query and counters are created/destroyed on the same thread
+///
+/// We therefore implement `Send` and `Sync` manually.
 pub struct InterfaceThroughput {
     query: HQUERY,
     recv_counter: HCOUNTER,
@@ -86,6 +96,11 @@ pub struct InterfaceThroughput {
     _recv_path_wide: Vec<u16>,
     _send_path_wide: Vec<u16>,
 }
+
+// SAFETY: PDH handles are only accessed from behind the NetworkEngine mutex;
+// no concurrent access to the same query occurs. See struct-level docs.
+unsafe impl Send for InterfaceThroughput {}
+unsafe impl Sync for InterfaceThroughput {}
 
 impl InterfaceThroughput {
     /// Open a PDH query and register the network interface counters.

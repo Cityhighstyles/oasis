@@ -27,6 +27,9 @@ use crate::rules::RulesManager;
 #[cfg(target_os = "windows")]
 use crate::pdh::InterfaceThroughput;
 
+#[cfg(target_os = "windows")]
+use crate::etw;
+
 #[cfg(not(target_os = "windows"))]
 pub struct InterfaceThroughput;
 
@@ -347,6 +350,29 @@ impl NetworkEngine {
                 }
             }
         }
+
+        // Start ETW (Event Tracing for Windows) network event consumer.
+        // This provides Resource Monitor-grade real-time per-PID byte tracking.
+        // Non-fatal: if ETW fails, we fall back to the polling-based approach.
+        self.start_etw();
+    }
+
+    /// Start the ETW network event consumer for real-time per-PID byte tracking.
+    ///
+    /// ETW gives us event-driven kernel notifications every time a process
+    /// sends or receives data — exactly like Resource Monitor.
+    fn start_etw(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            match etw::start() {
+                Ok(()) => log::info!("ETW network event trace started successfully"),
+                Err(e) => log::warn!("ETW start failed (non-fatal, falling back to polling): {e}"),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = &self;
+        }
     }
 
     /// Clone the current process entry snapshot for the Tauri command handler.
@@ -611,11 +637,55 @@ impl NetworkEngine {
             }
         }
 
-        // 4. Auto-block via registry — before building entries, sync WFP filters
+        // 4. Integrate ETW real-time per-PID byte counts.
+        //    ETW (Event Tracing for Windows) gives us event-driven kernel
+        //    notifications — exactly like Resource Monitor — for every
+        //    send/receive operation. These byte counts are more accurate
+        //    and responsive than polling-based EStats/IO counters.
+        //
+        //    ETW data is merged into stats_map, taking priority over the
+        //    polling-based data for the current tick's delta.
+        #[cfg(target_os = "windows")]
+        if let Some(etw_snapshot) = etw::take_snapshot() {
+            let tracked = etw_snapshot.tracked_events;
+            let pid_count = etw_snapshot.per_pid.len();
+
+            for (pid, (etw_recv, etw_send)) in etw_snapshot.per_pid {
+                if let Some(entry) = stats_map.get_mut(&pid) {
+                    // ETW data overrides the polling-based byte delta.
+                    // This gives us true event-driven per-process accuracy.
+                    if etw_recv > 0 || etw_send > 0 {
+                        entry.bytes_in = etw_recv;
+                        entry.bytes_out = etw_send;
+                    }
+                } else {
+                    // PID from ETW not in stats_map yet — add it
+                    let exe_path = crate::iphelper::resolve_process_path(pid)
+                        .unwrap_or_default();
+                    stats_map.insert(pid, ProcessNetStats {
+                        pid,
+                        exe_path,
+                        bytes_in: etw_recv,
+                        bytes_out: etw_send,
+                        ..Default::default()
+                    });
+                }
+            }
+
+            if tracked > 0 {
+                log::debug!(
+                    "ETW: {} events, {} PIDs tracked",
+                    tracked,
+                    pid_count,
+                );
+            }
+        }
+
+        // 5. Auto-block via registry — before building entries, sync WFP filters
         //    for any process whose exe name matches the AutoBlockRegistry.
         self.sync_auto_block_filters(&stats_map);
 
-        // 5. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
+        // 6. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
         let mut new_entries: Vec<ProcessEntry> = Vec::with_capacity(stats_map.len());
 
         for (pid, net_stats) in &stats_map {
@@ -693,7 +763,7 @@ impl NetworkEngine {
             });
         }
 
-        // 6. Preserve dormant processes — only when the *specific PID* (not just exe_path)
+        // 7. Preserve dormant processes — only when the *specific PID* (not just exe_path)
         //    is no longer in the current snapshot. This prevents a new PID for the same
         //    executable from suppressing the old PID's historical entry.
         for (exe_key, acc) in &self.accumulators {
@@ -739,17 +809,28 @@ impl NetworkEngine {
             }
         }
 
-        // 7. Sort by session data descending (highest consumers first)
+        // 8. Sort by session data descending (highest consumers first)
         new_entries.sort_by(|a, b| {
             b.session_data
                 .partial_cmp(&a.session_data)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 8. Detect data spikes before finalising the entries
+        // 9. Detect data spikes before finalising the entries
         self.detect_spikes(&new_entries);
 
         self.entries = new_entries;
+    }
+}
+
+// ── ETW cleanup on drop ────────────────────────────────────────────────
+
+/// Clean up the ETW trace session when the engine is dropped.
+/// Orphaned sessions cause `ERROR_ALREADY_EXISTS` on next launch.
+impl Drop for NetworkEngine {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        crate::etw::stop();
     }
 }
 

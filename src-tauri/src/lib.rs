@@ -22,6 +22,9 @@ pub mod procctl;
 #[cfg(target_os = "windows")]
 pub mod pdh;
 
+#[cfg(target_os = "windows")]
+pub mod etw;
+
 pub mod carbon;
 pub mod engine;
 pub mod commands;
