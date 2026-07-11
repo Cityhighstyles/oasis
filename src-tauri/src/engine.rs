@@ -24,13 +24,13 @@ use serde::{Deserialize, Serialize};
 use crate::carbon::{CarbonTracker, CarbonStats};
 use crate::rules::RulesManager;
 
+#[cfg(target_os = "windows")]
+use crate::iphelper::{self, ProcessNetStats};
+
 // winrt-toast-reborn is a [target.'cfg(windows)'.dependencies] in Cargo.toml,
 // so it must be gated behind cfg(windows) to avoid non-Windows compile errors.
 #[cfg(target_os = "windows")]
 use winrt_toast_reborn::{Toast, ToastManager, Action};
-
-#[cfg(target_os = "windows")]
-use crate::iphelper::{self, ProcessNetStats};
 
 #[cfg(target_os = "windows")]
 use crate::wfp::WfpEngine;
@@ -181,9 +181,12 @@ pub struct NetworkEngine {
     entries: Vec<ProcessEntry>,
     /// Historical per-exe-path metadata for dormant process preservation.
     accumulators: HashMap<String, ProcessAccumulator>,
-    /// Cumulative IO_COUNTERS.OtherTransferCount per PID (total since first seen).
+    /// Cumulative TCP bytes per PID from EStats (total since first seen).
     per_pid_cumulative: HashMap<u32, u64>,
-    /// Previous IO_COUNTERS.OtherTransferCount per PID, used to compute byte deltas.
+    /// Previous TCP EStats cumulative bytes per PID, used to compute byte deltas.
+    #[cfg(target_os = "windows")]
+    last_tcp_estats_bytes: HashMap<u32, u64>,
+    /// Previous IO_COUNTERS.OtherTransferCount per PID (fallback for UDP-only PIDs).
     #[cfg(target_os = "windows")]
     last_io_other_bytes: HashMap<u32, u64>,
     /// Set of PIDs that have been suspended by the user.
@@ -212,6 +215,8 @@ impl NetworkEngine {
             entries: Vec::new(),
             accumulators: HashMap::new(),
             per_pid_cumulative: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            last_tcp_estats_bytes: HashMap::new(),
             #[cfg(target_os = "windows")]
             last_io_other_bytes: HashMap::new(),
             #[cfg(target_os = "windows")]
@@ -478,30 +483,59 @@ impl NetworkEngine {
         // 2. Add UDP connection counts to the same map
         iphelper::collect_udp_counts(&mut stats_map);
 
-        // 3. Query IO_COUNTERS.OtherTransferCount for per-process byte tracking.
-        //    This captures all socket I/O (TCP + UDP + IPv4 + IPv6) as a cumulative
-        //    counter from process start. We compute a delta from the previous poll
-        //    value and store it in bytes_in as a per-tick delta.
+        // 3. Track bytes per PID.
+        //
+        //    Strategy: use GetProcessIoCounters.OtherTransferCount as the
+        //    AUTHORITATIVE cumulative counter because it captures ALL socket I/O
+        //    (TCP, UDP, IPv4, IPv6 including QUIC/HTTP/3). TCP EStats (below) only
+        //    covers IPv4 TCP and would miss QUIC/UDP or IPv6 traffic.
+        //
+        //    For the per-tick speed we take the MAX of:
+        //    - IO counters delta (authoritative but may not update every tick)
+        //    - TCP EStats delta (more responsive for active TCP connections)
         #[cfg(target_os = "windows")]
         {
+            let tcp_bytes = iphelper::collect_tcp_bytes_by_pid();
             let pids: Vec<u32> = stats_map.keys().copied().collect();
+
             for pid in &pids {
+                // ── Authoritative cumulative counter ────────────────────────
                 if let Some(current_other) = iphelper::get_process_other_bytes(*pid) {
                     let prev = self.last_io_other_bytes.get(pid).copied();
-                    let delta = match prev {
-                        // Already seen this PID — compute bytes since last poll
+                    let io_delta = match prev {
                         Some(p) => current_other.saturating_sub(p),
-                        // First time — skip historical bytes, just set baseline
                         None => 0,
                     };
+
+                    // ── TCP EStats delta for accurate per-tick speed ────────
+                    let estats_delta = tcp_bytes
+                        .get(pid)
+                        .map(|&(cum_in, _)| {
+                            let prev_estats = self
+                                .last_tcp_estats_bytes
+                                .get(pid)
+                                .copied()
+                                .unwrap_or(0);
+                            cum_in.saturating_sub(prev_estats)
+                        })
+                        .unwrap_or(0);
+
+                    // Use the best available per-tick byte count for speed
+                    let best_delta = io_delta.max(estats_delta);
+
                     if let Some(entry) = stats_map.get_mut(pid) {
-                        entry.bytes_in = delta;
+                        entry.bytes_in = best_delta;
                         entry.bytes_out = 0;
                     }
-                    self.last_io_other_bytes.insert(*pid, current_other);
 
-                    // Track per-PID cumulative bytes (independent of exe_path)
-                    *self.per_pid_cumulative.entry(*pid).or_insert(0) += delta;
+                    // Cumulative tracking always uses IO counters (all protocols)
+                    self.last_io_other_bytes.insert(*pid, current_other);
+                    *self.per_pid_cumulative.entry(*pid).or_insert(0) += io_delta;
+
+                    // Keep EStats baseline for next tick's speed comparison
+                    if let Some(&(cum_in, _)) = tcp_bytes.get(pid) {
+                        self.last_tcp_estats_bytes.insert(*pid, cum_in);
+                    }
                 }
             }
         }

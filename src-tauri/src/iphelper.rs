@@ -27,6 +27,57 @@ use windows_sys::Win32::System::Threading::{
 
 // ─────────────────────────────── Windows API declarations ────────────────────
 
+// ── TCP Extended Statistics (EStats) types ────────────────────────────────
+// Used to get accurate per-connection TCP byte counts (unlike
+// GetProcessIoCounters which does NOT reliably capture socket I/O).
+
+/// TCP_ESTATS_TYPE: TcpConnectionEstatsData = 0
+const TCP_ESTATS_DATA: u32 = 0;
+
+#[repr(C)]
+struct TcpEstatsDataRwV0 {
+    EnableCollection: u8, // BOOLEAN
+}
+
+#[repr(C)]
+struct TcpEstatsDataRodV0 {
+    DataBytesOut: u64,
+    DataBytesIn: u64,
+    DataSegmentsOut: u64,
+    DataSegmentsIn: u64,
+}
+
+// SetPerTcpConnectionEStats / GetPerTcpConnectionEStats from iphlpapi.dll
+extern "system" {
+    fn SetPerTcpConnectionEStats(
+        Row: *const MIB_TCPROW_OWNER_PID,
+        EstatsType: u32,
+        Rw: *const u8,
+        RwVersion: u32,
+        RwSize: u32,
+        Ros: *const u8,
+        RosVersion: u32,
+        RosSize: u32,
+        Rod: *const u8,
+        RodVersion: u32,
+        RodSize: u32,
+    ) -> u32;
+
+    fn GetPerTcpConnectionEStats(
+        Row: *const MIB_TCPROW_OWNER_PID,
+        EstatsType: u32,
+        Rw: *mut u8,
+        RwVersion: u32,
+        RwSize: u32,
+        Ros: *mut u8,
+        RosVersion: u32,
+        RosSize: u32,
+        Rod: *mut u8,
+        RodVersion: u32,
+        RodSize: u32,
+    ) -> u32;
+}
+
 // I/O counters struct (manually declared as windows-sys 0.61 doesn't expose it).
 #[allow(non_snake_case)]
 #[repr(C)]
@@ -78,9 +129,83 @@ pub struct TcpConnectionStats {
 
 // ──────────────────────────── public functions ───────────────────────────────
 
+/// Query TCP Extended Statistics (EStats) for all active TCPv4 connections
+/// and return cumulative bytes received/sent per PID.
+///
+/// This is the **accurate** method for measuring network data transfer per
+/// process, as opposed to `GetProcessIoCounters` which does NOT include
+/// socket I/O on modern Windows.
+///
+/// Returns a map: PID → (cumulative_bytes_in, cumulative_bytes_out).
+/// The values are cumulative over each connection's lifetime.
+pub fn collect_tcp_bytes_by_pid() -> HashMap<u32, (u64, u64)> {
+    let mut result: HashMap<u32, (u64, u64)> = HashMap::new();
+
+    let rows = match get_tcp_table_rows() {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("collect_tcp_bytes_by_pid: {e}");
+            return result;
+        }
+    };
+
+    for row in &rows {
+        let pid = row.dwOwningPid;
+        if pid <= 4 {
+            continue;
+        }
+
+        // Enable EStats data collection for this connection.
+        // May already be enabled — that's fine; the call is idempotent.
+        let rw = TcpEstatsDataRwV0 { EnableCollection: 1 };
+        unsafe {
+            let _ = SetPerTcpConnectionEStats(
+                row as *const MIB_TCPROW_OWNER_PID,
+                TCP_ESTATS_DATA,
+                &rw as *const TcpEstatsDataRwV0 as *const u8,
+                0,
+                std::mem::size_of::<TcpEstatsDataRwV0>() as u32,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                0,
+            );
+        }
+
+        // Read the byte counters
+        let mut rod: TcpEstatsDataRodV0 = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            GetPerTcpConnectionEStats(
+                row as *const MIB_TCPROW_OWNER_PID,
+                TCP_ESTATS_DATA,
+                std::ptr::null_mut(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                0,
+                &mut rod as *mut TcpEstatsDataRodV0 as *mut u8,
+                0,
+                std::mem::size_of::<TcpEstatsDataRodV0>() as u32,
+            )
+        };
+
+        if ret == 0 {
+            let entry = result.entry(pid).or_insert((0, 0));
+            entry.0 += rod.DataBytesIn;
+            entry.1 += rod.DataBytesOut;
+        }
+    }
+
+    result
+}
+
 /// Enumerate all active IPv4 TCP connections and return per-connection info.
-/// Note: byte tracking is now done via GetProcessIoCounters (covers all protocols),
-/// so this function only provides connection counts and process identity.
+/// Byte tracking is now done via `collect_tcp_bytes_by_pid()` using TCP
+/// Extended Statistics (EStats), so this function only provides connection
+/// counts and process identity.
 pub fn collect_tcp_connection_stats() -> Vec<TcpConnectionStats> {
     let rows = match get_tcp_table_rows() {
         Ok(r) => r,
