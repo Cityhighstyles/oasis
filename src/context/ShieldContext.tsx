@@ -14,6 +14,8 @@ export type ProcessEntry = {
   speed: number
   connections: number
   lastSeen: string
+  /** "etw" | "estats" | "io_counters" | "blended" */
+  dataSource: string
 }
 
 export type Rule = {

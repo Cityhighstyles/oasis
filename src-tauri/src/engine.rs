@@ -168,6 +168,12 @@ pub struct ProcessEntry {
     pub connections: usize,
     /// "now" while active, or last HH:MM:SS timestamp when dormant.
     pub last_seen: String,
+    /// Data source for the current speed value.
+    /// "etw" — pure Event Tracing for Windows (Resource Monitor style)
+    /// "estats" — TCP Extended Statistics (polling-based, accurate for TCP)
+    /// "io_counters" — IO counters fallback (covers all protocols, less responsive)
+    /// "blended" — weighted blend: 0.7× ETW + 0.3× polling
+    pub data_source: String,
 }
 // ────────────────────────────── engine state ─────────────────────────────────
 
@@ -580,7 +586,7 @@ impl NetworkEngine {
         // 3. Add UDP connection counts to the same map
         iphelper::collect_udp_counts(&mut stats_map);
 
-        // 3. Track bytes per PID.
+        // 4. Track bytes per PID using EStats + IO counters (the polling-based approach).
         //
         //    Strategy: use GetProcessIoCounters.OtherTransferCount as the
         //    AUTHORITATIVE cumulative counter because it captures ALL socket I/O
@@ -590,6 +596,12 @@ impl NetworkEngine {
         //    For the per-tick speed we take the MAX of:
         //    - IO counters delta (authoritative but may not update every tick)
         //    - TCP EStats delta (more responsive for active TCP connections)
+        //
+        //    We store the polling delta in `polling_deltas` for later blending
+        //    with ETW data (which arrives at step 5).
+        #[cfg(target_os = "windows")]
+        let mut polling_deltas: HashMap<u32, u64> = HashMap::new();
+
         #[cfg(target_os = "windows")]
         {
             let tcp_bytes = iphelper::collect_tcp_bytes_by_pid();
@@ -620,6 +632,9 @@ impl NetworkEngine {
                     // Use the best available per-tick byte count for speed
                     let best_delta = io_delta.max(estats_delta);
 
+                    // Store the polling delta for later blending with ETW
+                    polling_deltas.insert(*pid, best_delta);
+
                     if let Some(entry) = stats_map.get_mut(pid) {
                         entry.bytes_in = best_delta;
                         entry.bytes_out = 0;
@@ -637,27 +652,65 @@ impl NetworkEngine {
             }
         }
 
-        // 4. Integrate ETW real-time per-PID byte counts.
+        // 5. Integrate ETW real-time per-PID byte counts with weighted blending.
+        //
         //    ETW (Event Tracing for Windows) gives us event-driven kernel
         //    notifications — exactly like Resource Monitor — for every
-        //    send/receive operation. These byte counts are more accurate
-        //    and responsive than polling-based EStats/IO counters.
+        //    send/receive operation. These byte counts are more responsive
+        //    than polling-based EStats/IO counters.
         //
-        //    ETW data is merged into stats_map, taking priority over the
-        //    polling-based data for the current tick's delta.
+        //    Blending strategy:
+        //    - ETW data reflects only TCP/IP events (not QUIC/UDP/ICMP)
+        //    - IO counters cover all protocols but update less frequently
+        //    - Weighted blend: 0.7 × ETW + 0.3 × polling_delta when ETW fires
+        //    - If ETW is silent for a PID, polling delta is used as-is
+        //
+        //    We also build pid_data_sources to track which measurement
+        //    technique produced each PID's final speed value, so the
+        //    front-end can show a "ETW", "EStats", or "Blended" badge.
+        #[cfg(target_os = "windows")]
+        let mut pid_data_sources: HashMap<u32, String> = HashMap::new();
+
+        // Pre-populate with "estats" for every PID that had a polling delta
+        #[cfg(target_os = "windows")]
+        for (&pid, _) in polling_deltas.iter() {
+            pid_data_sources.entry(pid).or_insert_with(|| "estats".into());
+        }
+
         #[cfg(target_os = "windows")]
         if let Some(etw_snapshot) = etw::take_snapshot() {
             let tracked = etw_snapshot.tracked_events;
-            let pid_count = etw_snapshot.per_pid.len();
+            let pid_count = etw_snapshot.per_pid.len(); // capture before for-loop consumes it
 
             for (pid, (etw_recv, etw_send)) in etw_snapshot.per_pid {
+                let polling = polling_deltas.get(&pid).copied().unwrap_or(0);
+
+                // Determine data source label for this PID
+                let source_label = if etw_recv > 0 && polling > 0 {
+                    "blended"
+                } else if etw_recv > 0 {
+                    "etw"
+                } else {
+                    "estats"
+                };
+                pid_data_sources.insert(pid, source_label.into());
+
+                // Only blend if ETW actually measured meaningful traffic
+                let final_in = if etw_recv > 0 && polling > 0 {
+                    // Weighted blend: trust ETW (TCP) more, but keep polling
+                    // (non-TCP protocols) as a minority contribution
+                    ((etw_recv as f64 * 0.7) + (polling as f64 * 0.3)) as u64
+                } else if etw_recv > 0 {
+                    etw_recv
+                } else {
+                    polling
+                };
+
+                let final_out = if etw_send > 0 { etw_send } else { 0 };
+
                 if let Some(entry) = stats_map.get_mut(&pid) {
-                    // ETW data overrides the polling-based byte delta.
-                    // This gives us true event-driven per-process accuracy.
-                    if etw_recv > 0 || etw_send > 0 {
-                        entry.bytes_in = etw_recv;
-                        entry.bytes_out = etw_send;
-                    }
+                    entry.bytes_in = final_in;
+                    entry.bytes_out = final_out;
                 } else {
                     // PID from ETW not in stats_map yet — add it
                     let exe_path = crate::iphelper::resolve_process_path(pid)
@@ -665,8 +718,8 @@ impl NetworkEngine {
                     stats_map.insert(pid, ProcessNetStats {
                         pid,
                         exe_path,
-                        bytes_in: etw_recv,
-                        bytes_out: etw_send,
+                        bytes_in: final_in,
+                        bytes_out: final_out,
                         ..Default::default()
                     });
                 }
@@ -674,18 +727,18 @@ impl NetworkEngine {
 
             if tracked > 0 {
                 log::debug!(
-                    "ETW: {} events, {} PIDs tracked",
+                    "ETW blended: {} events, {} PIDs",
                     tracked,
                     pid_count,
                 );
             }
         }
 
-        // 5. Auto-block via registry — before building entries, sync WFP filters
+        // 6. Auto-block via registry — before building entries, sync WFP filters
         //    for any process whose exe name matches the AutoBlockRegistry.
         self.sync_auto_block_filters(&stats_map);
 
-        // 6. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
+        // 7. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
         let mut new_entries: Vec<ProcessEntry> = Vec::with_capacity(stats_map.len());
 
         for (pid, net_stats) in &stats_map {
@@ -747,6 +800,15 @@ impl NetworkEngine {
                 }
             }
 
+            // Determine data source for this PID
+            #[cfg(target_os = "windows")]
+            let source = pid_data_sources
+                .get(pid)
+                .cloned()
+                .unwrap_or_else(|| "io_counters".into());
+            #[cfg(not(target_os = "windows"))]
+            let source = "io_counters".to_string();
+
             new_entries.push(ProcessEntry {
                 pid: *pid,
                 name: display_name,
@@ -760,10 +822,11 @@ impl NetworkEngine {
                 } else {
                     acc.last_seen.clone()
                 },
+                data_source: source,
             });
         }
 
-        // 7. Preserve dormant processes — only when the *specific PID* (not just exe_path)
+        // 8. Preserve dormant processes — only when the *specific PID* (not just exe_path)
         //    is no longer in the current snapshot. This prevents a new PID for the same
         //    executable from suppressing the old PID's historical entry.
         for (exe_key, acc) in &self.accumulators {
@@ -804,19 +867,20 @@ impl NetworkEngine {
                         speed: 0.0,
                         connections: 0,
                         last_seen: prev_last_seen,
+                        data_source: "io_counters".into(),
                     });
                 }
             }
         }
 
-        // 8. Sort by session data descending (highest consumers first)
+        // 9. Sort by session data descending (highest consumers first)
         new_entries.sort_by(|a, b| {
             b.session_data
                 .partial_cmp(&a.session_data)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 9. Detect data spikes before finalising the entries
+        // 10. Detect data spikes before finalising the entries
         self.detect_spikes(&new_entries);
 
         self.entries = new_entries;

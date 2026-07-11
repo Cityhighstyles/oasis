@@ -163,6 +163,43 @@ const SYSTEM_SERVICE_EXES = new Set([
   "startmenuexperiencehost.exe",
 ])
 
+// ────────────────── data source badge config ────────────────────────
+
+const DATA_SOURCE_CONFIG: Record<string, { label: string; badge: string }> = {
+  etw: {
+    label: "ETW",
+    badge: "border-purple-500/30 text-purple-400 bg-purple-500/5",
+  },
+  estats: {
+    label: "EStats",
+    badge: "border-blue-500/30 text-blue-400 bg-blue-500/5",
+  },
+  blended: {
+    label: "Blended",
+    badge: "border-amber-500/30 text-amber-400 bg-amber-500/5",
+  },
+  io_counters: {
+    label: "IO",
+    badge: "border-muted-foreground/30 text-muted-foreground bg-muted/30",
+  },
+  mixed: {
+    label: "Mixed",
+    badge: "border-indigo-500/30 text-indigo-400 bg-indigo-500/5",
+  },
+}
+
+function DataSourceBadge({ source, className }: { source: string; className?: string }) {
+  const cfg = DATA_SOURCE_CONFIG[source] ?? DATA_SOURCE_CONFIG.io_counters
+  return (
+    <Badge
+      variant="outline"
+      className={cn("text-[8px] px-1 h-3.5 leading-none font-mono", cfg.badge, className)}
+    >
+      {cfg.label}
+    </Badge>
+  )
+}
+
 // ──────────────────────────── speed helpers ──────────────────────────
 
 type SpeedTrend = "stable" | "rising" | "spiking"
@@ -298,8 +335,11 @@ function PidSubRow({ proc, isOperating, wfpAvailable, isSuspended, onSuspend, on
           {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
         </span>
         {proc.speed > 0 && (
-          <span className={cn("block text-[9px] tabular-nums font-medium leading-tight mt-0.5", TREND_TEXT[speedTrend])}>
-            ↑ {formatSpeed(proc.speed)}
+          <span className="flex items-center gap-1 mt-0.5">
+            <span className={cn("text-[9px] tabular-nums font-medium leading-tight", TREND_TEXT[speedTrend])}>
+              ↑ {formatSpeed(proc.speed)}
+            </span>
+            <DataSourceBadge source={proc.dataSource} />
           </span>
         )}
       </div>
@@ -957,6 +997,15 @@ export function LiveMonitor() {
                               ↑ {formatSpeed(totalSpeed)}
                             </span>
                             <MicroSparkline samples={history} maxVal={maxSpeed} trend={trend} />
+                            {/* Show data source badge — per-PID badges shown in expanded rows */}
+                            {(() => {
+                              const sources = new Set(group.processes.map(p => p.dataSource))
+                              if (sources.size === 1) {
+                                return <DataSourceBadge source={group.processes[0].dataSource} />
+                              }
+                              // Don't show a badge when sources differ — per-PID badges in sub-rows are accurate
+                              return null
+                            })()}
                           </div>
                         )}
                       </div>
