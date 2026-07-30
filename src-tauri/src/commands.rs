@@ -466,6 +466,79 @@ pub fn set_spike_min_speed(
     Ok(())
 }
 
+// ═══════════════════════════════ History Commands ═══════════════════════════
+
+/// Get total bytes sent/received for a specific app across all time.
+#[tauri::command]
+pub fn get_app_history_totals(
+    app_path: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let engine = state.0.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+    let db = engine.db().ok_or("Database not available")?;
+    let db = db.lock().map_err(|e| format!("db lock poisoned: {e}"))?;
+    let (sent, received) = db.get_app_totals(&app_path)?;
+    Ok(serde_json::json!({
+        "bytesSent": sent,
+        "bytesReceived": received,
+    }))
+}
+
+/// Get all apps with their total bandwidth, ordered by total usage descending.
+#[tauri::command]
+pub fn get_all_app_history_totals(
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let engine = state.0.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+    let db = engine.db().ok_or("Database not available")?;
+    let db = db.lock().map_err(|e| format!("db lock poisoned: {e}"))?;
+    let rows = db.get_all_app_totals()?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, name, sent, received)| {
+            serde_json::json!({
+                "appPath": path,
+                "appName": name,
+                "bytesSent": sent,
+                "bytesReceived": received,
+            })
+        })
+        .collect())
+}
+
+/// Get hourly usage for a specific app (last N hours).
+#[tauri::command]
+pub fn get_app_hourly_usage(
+    app_path: String,
+    hours: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let engine = state.0.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+    let db = engine.db().ok_or("Database not available")?;
+    let db = db.lock().map_err(|e| format!("db lock poisoned: {e}"))?;
+    let rows = db.get_hourly_usage(&app_path, hours)?;
+    Ok(rows
+        .into_iter()
+        .map(|(bucket, sent, received)| {
+            serde_json::json!({
+                "timestampBucket": bucket,
+                "bytesSent": sent,
+                "bytesReceived": received,
+            })
+        })
+        .collect())
+}
+
+/// Flush pending data to SQLite immediately.
+#[tauri::command]
+pub fn flush_db_now(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut engine = state.0.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+    engine.flush_to_db();
+    Ok(())
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 // Note: parse_command_type was removed — CommandType::from_label() on the enum
 // provides the equivalent functionality with less duplication.

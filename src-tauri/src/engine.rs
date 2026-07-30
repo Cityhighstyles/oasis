@@ -16,12 +16,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
 use crate::carbon::{CarbonTracker, CarbonStats};
+use crate::db::{DatabaseManager, PendingDelta};
 use crate::rules::RulesManager;
 
 #[cfg(target_os = "windows")]
@@ -35,6 +37,8 @@ pub struct InterfaceThroughput;
 
 #[cfg(target_os = "windows")]
 use crate::iphelper::{self, ProcessNetStats};
+#[cfg(not(target_os = "windows"))]
+use stub::ProcessNetStats;
 
 // winrt-toast-reborn is a [target.'cfg(windows)'.dependencies] in Cargo.toml,
 // so it must be gated behind cfg(windows) to avoid non-Windows compile errors.
@@ -65,6 +69,8 @@ mod stub {
         }
         pub fn is_blocked(&self, _: &str) -> bool { false }
         pub fn blocked_paths(&self) -> Vec<String> { vec![] }
+        pub fn start_monitoring(&mut self) -> Result<(), String> { Ok(()) }
+        pub fn stop_monitoring(&mut self) {}
     }
 
     pub struct InterfaceThroughput;
@@ -159,9 +165,9 @@ pub struct ProcessEntry {
     pub exe: String,
     /// "blocked" | "active" | "monitoring"
     pub status: String,
-    /// MB transferred during this app session (cumulative, all protocols via IO counters).
+    /// MB transferred during this app session (cumulative bytes via ETW).
     pub session_data: f64,
-    /// Real-time speed in bytes/sec (delta since last 2-second poll tick).
+    /// Real-time speed in bytes/sec (dynamic time delta since last poll).
     /// 0 for dormant/monitoring processes.
     pub speed: f64,
     /// TCP + UDP socket count from the current snapshot.
@@ -169,10 +175,8 @@ pub struct ProcessEntry {
     /// "now" while active, or last HH:MM:SS timestamp when dormant.
     pub last_seen: String,
     /// Data source for the current speed value.
-    /// "etw" — pure Event Tracing for Windows (Resource Monitor style)
-    /// "estats" — TCP Extended Statistics (polling-based, accurate for TCP)
-    /// "io_counters" — IO counters fallback (covers all protocols, less responsive)
-    /// "blended" — weighted blend: 0.7× ETW + 0.3× polling
+    /// "etw" — sole source: Event Tracing for Windows (Resource Monitor style)
+    /// "dormant" — process exited, frozen historical data
     pub data_source: String,
 }
 // ────────────────────────────── engine state ─────────────────────────────────
@@ -202,14 +206,10 @@ pub struct NetworkEngine {
     entries: Vec<ProcessEntry>,
     /// Historical per-exe-path metadata for dormant process preservation.
     accumulators: HashMap<String, ProcessAccumulator>,
-    /// Cumulative TCP bytes per PID from EStats (total since first seen).
+    /// Timestamp of the last poll tick, used for dynamic speed calculation.
+    last_poll_instant: Instant,
+    /// Cumulative bytes per PID (total since first seen, used for session_data display).
     per_pid_cumulative: HashMap<u32, u64>,
-    /// Previous TCP EStats cumulative bytes per PID, used to compute byte deltas.
-    #[cfg(target_os = "windows")]
-    last_tcp_estats_bytes: HashMap<u32, u64>,
-    /// Previous IO_COUNTERS.OtherTransferCount per PID (fallback for UDP-only PIDs).
-    #[cfg(target_os = "windows")]
-    last_io_other_bytes: HashMap<u32, u64>,
     /// Set of PIDs that have been suspended by the user.
     #[cfg(target_os = "windows")]
     pub suspended_pids: std::collections::HashSet<u32>,
@@ -231,6 +231,14 @@ pub struct NetworkEngine {
     /// PDH performance counter reader for NDIS miniport driver throughput.
     #[cfg(target_os = "windows")]
     ndis_throughput: Option<InterfaceThroughput>,
+    /// SQLite database manager for persistent historical bandwidth data.
+    db_manager: Option<Arc<Mutex<DatabaseManager>>>,
+    /// Pending byte deltas to flush to SQLite on the next flush cycle.
+    pending_deltas: HashMap<String, PendingDelta>,
+    /// Timestamp of the last successful flush to SQLite.
+    last_flush_instant: Instant,
+    /// Flush interval in seconds — flush every 10 seconds.
+    flush_interval_secs: u64,
 }
 
 impl NetworkEngine {
@@ -243,10 +251,7 @@ impl NetworkEngine {
             entries: Vec::new(),
             accumulators: HashMap::new(),
             per_pid_cumulative: HashMap::new(),
-            #[cfg(target_os = "windows")]
-            last_tcp_estats_bytes: HashMap::new(),
-            #[cfg(target_os = "windows")]
-            last_io_other_bytes: HashMap::new(),
+            last_poll_instant: Instant::now(),
             #[cfg(target_os = "windows")]
             suspended_pids: std::collections::HashSet::new(),
             carbon_tracker: CarbonTracker::new(),
@@ -257,6 +262,10 @@ impl NetworkEngine {
             total_throughput: (0.0, 0.0),
             #[cfg(target_os = "windows")]
             ndis_throughput: None,
+            db_manager: None,
+            pending_deltas: HashMap::new(),
+            last_flush_instant: Instant::now(),
+            flush_interval_secs: 10,
         }
     }
 
@@ -335,10 +344,25 @@ impl NetworkEngine {
             Err(e) => log::warn!("WFP engine session failed to open (non-fatal): {e}"),
         }
 
+        // Start WFP network event monitoring for flow tracking and IPC isolation.
+        // Non-fatal: if monitoring fails, ETW still provides byte counts.
+        self.start_wfp_monitoring();
+
         // Initialize NDIS performance counters for total interface throughput.
         // Uses PDH to read the same counters as the Task Manager Performance tab.
         // Non-fatal: if PDH fails, we simply report 0 throughput.
         self.init_ndis_throughput();
+    }
+
+    /// Start WFP network event monitoring for flow tracking.
+    fn start_wfp_monitoring(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            match self.wfp.start_monitoring() {
+                Ok(()) => log::info!("WFP network event monitoring started"),
+                Err(e) => log::warn!("WFP monitoring start failed (non-fatal): {e}"),
+            }
+        }
     }
 
     /// Initialize the PDH-based NDIS throughput reader.
@@ -381,9 +405,19 @@ impl NetworkEngine {
         }
     }
 
+    /// Set the database manager for persistent storage.
+    pub fn set_db_manager(&mut self, db: Arc<Mutex<DatabaseManager>>) {
+        self.db_manager = Some(db);
+    }
+
     /// Clone the current process entry snapshot for the Tauri command handler.
     pub fn get_entries(&self) -> Vec<ProcessEntry> {
         self.entries.clone()
+    }
+
+    /// Get a reference to the database manager (if available).
+    pub fn db(&self) -> Option<&Arc<Mutex<DatabaseManager>>> {
+        self.db_manager.as_ref()
     }
 
     /// Return the current total network interface throughput.
@@ -529,15 +563,26 @@ impl NetworkEngine {
     }
 
     /// Perform one full telemetry poll and update `self.entries`.
-    /// Called from the background Tokio task.
+    /// Called from the background polling loop.
+    ///
+    /// Architecture (post-refactor):
+    ///   - ETW is the **sole** data source for per-PID byte tracking.
+    ///   - Speed is computed dynamically using `Instant` timestamps.
+    ///   - No more blending of polling + ETW — ETW provides event-driven
+    ///     kernel notifications for every TCP send/receive.
+    ///   - UDP/QUIC coverage will be added in Step 2 (enhanced ETW parser).
     pub fn poll(&mut self) {
         let now = Local::now().format("%H:%M:%S").to_string();
 
+        // Compute dynamic time delta since last poll (replaces fixed 2.0 divisor).
+        let elapsed = self.last_poll_instant.elapsed().as_secs_f64();
+        let elapsed = elapsed.max(0.001); // floor to 1ms to avoid division by zero
+        self.last_poll_instant = Instant::now();
+
         // 1. Collect connection counts for ALL protocols.
-        //    Byte tracking uses GetProcessIoCounters (covers TCP+UDP+IPv4+IPv6).
         let mut stats_map: HashMap<u32, ProcessNetStats> = HashMap::new();
 
-        // 1a. TCP IPv4 connections (for connection count only — EStats bytes not used)
+        // 1a. TCP IPv4 connections (for connection count)
         #[cfg(target_os = "windows")]
         {
             for conn in iphelper::collect_tcp_connection_stats() {
@@ -549,7 +594,7 @@ impl NetworkEngine {
                 entry.tcp_connections += 1;
             }
 
-            // 1b. TCP IPv6 connections (for connection count only)
+            // 1b. TCP IPv6 connections
             for (pid, exe_path) in iphelper::collect_tcp6_connection_stats() {
                 let entry = stats_map.entry(pid).or_insert_with(|| ProcessNetStats {
                     pid,
@@ -566,8 +611,6 @@ impl NetworkEngine {
         }
 
         // 2. Poll NDIS miniport driver throughput via PDH performance counters.
-        //    This gives us the total interface bandwidth consumed at the hardware level,
-        //    just like the Task Manager Performance tab's network graph.
         #[cfg(target_os = "windows")]
         {
             if let Some(ref tp) = self.ndis_throughput {
@@ -583,134 +626,30 @@ impl NetworkEngine {
             }
         }
 
-        // 3. Add UDP connection counts to the same map
+        // 3. Add UDP connection counts to the map.
         iphelper::collect_udp_counts(&mut stats_map);
 
-        // 4. Track bytes per PID using EStats + IO counters (the polling-based approach).
-        //
-        //    Strategy: use GetProcessIoCounters.OtherTransferCount as the
-        //    AUTHORITATIVE cumulative counter because it captures ALL socket I/O
-        //    (TCP, UDP, IPv4, IPv6 including QUIC/HTTP/3). TCP EStats (below) only
-        //    covers IPv4 TCP and would miss QUIC/UDP or IPv6 traffic.
-        //
-        //    For the per-tick speed we take the MAX of:
-        //    - IO counters delta (authoritative but may not update every tick)
-        //    - TCP EStats delta (more responsive for active TCP connections)
-        //
-        //    We store the polling delta in `polling_deltas` for later blending
-        //    with ETW data (which arrives at step 5).
-        #[cfg(target_os = "windows")]
-        let mut polling_deltas: HashMap<u32, u64> = HashMap::new();
-
-        #[cfg(target_os = "windows")]
-        {
-            let tcp_bytes = iphelper::collect_tcp_bytes_by_pid();
-            let pids: Vec<u32> = stats_map.keys().copied().collect();
-
-            for pid in &pids {
-                // ── Authoritative cumulative counter ────────────────────────
-                if let Some(current_other) = iphelper::get_process_other_bytes(*pid) {
-                    let prev = self.last_io_other_bytes.get(pid).copied();
-                    let io_delta = match prev {
-                        Some(p) => current_other.saturating_sub(p),
-                        None => 0,
-                    };
-
-                    // ── TCP EStats delta for accurate per-tick speed ────────
-                    let estats_delta = tcp_bytes
-                        .get(pid)
-                        .map(|&(cum_in, _)| {
-                            let prev_estats = self
-                                .last_tcp_estats_bytes
-                                .get(pid)
-                                .copied()
-                                .unwrap_or(0);
-                            cum_in.saturating_sub(prev_estats)
-                        })
-                        .unwrap_or(0);
-
-                    // Use the best available per-tick byte count for speed
-                    let best_delta = io_delta.max(estats_delta);
-
-                    // Store the polling delta for later blending with ETW
-                    polling_deltas.insert(*pid, best_delta);
-
-                    if let Some(entry) = stats_map.get_mut(pid) {
-                        entry.bytes_in = best_delta;
-                        entry.bytes_out = 0;
-                    }
-
-                    // Cumulative tracking always uses IO counters (all protocols)
-                    self.last_io_other_bytes.insert(*pid, current_other);
-                    *self.per_pid_cumulative.entry(*pid).or_insert(0) += io_delta;
-
-                    // Keep EStats baseline for next tick's speed comparison
-                    if let Some(&(cum_in, _)) = tcp_bytes.get(pid) {
-                        self.last_tcp_estats_bytes.insert(*pid, cum_in);
-                    }
-                }
-            }
-        }
-
-        // 5. Integrate ETW real-time per-PID byte counts with weighted blending.
+        // 4. ETW: sole data source for per-PID byte tracking.
         //
         //    ETW (Event Tracing for Windows) gives us event-driven kernel
-        //    notifications — exactly like Resource Monitor — for every
-        //    send/receive operation. These byte counts are more responsive
-        //    than polling-based EStats/IO counters.
+        //    notifications — exactly like Resource Monitor — for every TCP
+        //    and UDP send/receive operation. No more polling-based fallback;
+        //    ETW is the single source of truth.
         //
-        //    Blending strategy:
-        //    - ETW data reflects only TCP/IP events (not QUIC/UDP/ICMP)
-        //    - IO counters cover all protocols but update less frequently
-        //    - Weighted blend: 0.7 × ETW + 0.3 × polling_delta when ETW fires
-        //    - If ETW is silent for a PID, polling delta is used as-is
-        //
-        //    We also build pid_data_sources to track which measurement
-        //    technique produced each PID's final speed value, so the
-        //    front-end can show a "ETW", "EStats", or "Blended" badge.
-        #[cfg(target_os = "windows")]
-        let mut pid_data_sources: HashMap<u32, String> = HashMap::new();
-
-        // Pre-populate with "estats" for every PID that had a polling delta
-        #[cfg(target_os = "windows")]
-        for (&pid, _) in polling_deltas.iter() {
-            pid_data_sources.entry(pid).or_insert_with(|| "estats".into());
-        }
-
+        //    Protocol coverage: TCP (opcodes 10, 11, 26, 27) +
+        //    UDP (opcodes 12, 13, 28, 29) for QUIC/HTTP3, DNS, gaming.
         #[cfg(target_os = "windows")]
         if let Some(etw_snapshot) = etw::take_snapshot() {
             let tracked = etw_snapshot.tracked_events;
-            let pid_count = etw_snapshot.per_pid.len(); // capture before for-loop consumes it
+            let pid_count = etw_snapshot.per_pid.len();
 
             for (pid, (etw_recv, etw_send)) in etw_snapshot.per_pid {
-                let polling = polling_deltas.get(&pid).copied().unwrap_or(0);
-
-                // Determine data source label for this PID
-                let source_label = if etw_recv > 0 && polling > 0 {
-                    "blended"
-                } else if etw_recv > 0 {
-                    "etw"
-                } else {
-                    "estats"
-                };
-                pid_data_sources.insert(pid, source_label.into());
-
-                // Only blend if ETW actually measured meaningful traffic
-                let final_in = if etw_recv > 0 && polling > 0 {
-                    // Weighted blend: trust ETW (TCP) more, but keep polling
-                    // (non-TCP protocols) as a minority contribution
-                    ((etw_recv as f64 * 0.7) + (polling as f64 * 0.3)) as u64
-                } else if etw_recv > 0 {
-                    etw_recv
-                } else {
-                    polling
-                };
-
-                let final_out = if etw_send > 0 { etw_send } else { 0 };
+                let bytes_in = etw_recv;
+                let bytes_out = etw_send;
 
                 if let Some(entry) = stats_map.get_mut(&pid) {
-                    entry.bytes_in = final_in;
-                    entry.bytes_out = final_out;
+                    entry.bytes_in = bytes_in;
+                    entry.bytes_out = bytes_out;
                 } else {
                     // PID from ETW not in stats_map yet — add it
                     let exe_path = crate::iphelper::resolve_process_path(pid)
@@ -718,8 +657,8 @@ impl NetworkEngine {
                     stats_map.insert(pid, ProcessNetStats {
                         pid,
                         exe_path,
-                        bytes_in: final_in,
-                        bytes_out: final_out,
+                        bytes_in,
+                        bytes_out,
                         ..Default::default()
                     });
                 }
@@ -727,18 +666,17 @@ impl NetworkEngine {
 
             if tracked > 0 {
                 log::debug!(
-                    "ETW blended: {} events, {} PIDs",
+                    "ETW: {} events, {} PIDs",
                     tracked,
                     pid_count,
                 );
             }
         }
 
-        // 6. Auto-block via registry — before building entries, sync WFP filters
-        //    for any process whose exe name matches the AutoBlockRegistry.
+        // 5. Auto-block via registry — sync WFP filters for matching processes.
         self.sync_auto_block_filters(&stats_map);
 
-        // 7. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
+        // 6. Build entries — each PID gets its own session_data from per-PID cumulative tracking.
         let mut new_entries: Vec<ProcessEntry> = Vec::with_capacity(stats_map.len());
 
         for (pid, net_stats) in &stats_map {
@@ -753,7 +691,7 @@ impl NetworkEngine {
 
             let display_name = display_name_for(&net_stats.exe_path);
 
-            // Update accumulator metadata for dormant preservation (no byte tracking here)
+            // Update accumulator metadata for dormant preservation
             let acc = self
                 .accumulators
                 .entry(exe_key.clone())
@@ -767,12 +705,12 @@ impl NetworkEngine {
             acc.original_exe_path = net_stats.exe_path.clone();
             acc.last_seen = now.clone();
 
-            // Session data from per-PID cumulative bytes (NOT shared across PIDs)
+            // Session data from per-PID cumulative bytes
             let pid_cumulative = self.per_pid_cumulative.get(pid).copied().unwrap_or(0);
             let session_mb = round2(bytes_to_mb(pid_cumulative));
 
-            // Speed in bytes/sec from the delta (poll interval is 2 seconds)
-            let speed = net_stats.bytes_in as f64 / 2.0;
+            // Dynamic speed: bytes_delta / elapsed_secs (replaces fixed / 2.0)
+            let speed = net_stats.bytes_in as f64 / elapsed;
 
             let status = if is_blocked {
                 "blocked"
@@ -791,8 +729,7 @@ impl NetworkEngine {
                 is_blocked,
             );
 
-            // Attribute blocked bytes to matching rules so that
-            // rule.data_blocked_bytes reflects real traffic, not hardcoded defaults.
+            // Attribute blocked bytes to matching rules
             if registry_blocked && delta_bytes > 0 {
                 let matching_ids = self.rules_manager.get_matching_rule_ids(&exe_name);
                 for rule_id in matching_ids {
@@ -800,14 +737,21 @@ impl NetworkEngine {
                 }
             }
 
-            // Determine data source for this PID
+            // Update cumulative bytes for session data
+            *self.per_pid_cumulative.entry(*pid).or_insert(0) += delta_bytes;
+
+            // Accumulate pending deltas for SQLite flush
+            if delta_bytes > 0 || net_stats.bytes_out > 0 {
+                let delta = self.pending_deltas.entry(exe_key.clone()).or_default();
+                delta.bytes_received += delta_bytes;
+                delta.bytes_sent += net_stats.bytes_out;
+            }
+
+            // Data source is always ETW now
             #[cfg(target_os = "windows")]
-            let source = pid_data_sources
-                .get(pid)
-                .cloned()
-                .unwrap_or_else(|| "io_counters".into());
+            let source = "etw".to_string();
             #[cfg(not(target_os = "windows"))]
-            let source = "io_counters".to_string();
+            let source = "unavailable".to_string();
 
             new_entries.push(ProcessEntry {
                 pid: *pid,
@@ -826,18 +770,14 @@ impl NetworkEngine {
             });
         }
 
-        // 8. Preserve dormant processes — only when the *specific PID* (not just exe_path)
-        //    is no longer in the current snapshot. This prevents a new PID for the same
-        //    executable from suppressing the old PID's historical entry.
+        // 7. Preserve dormant processes — only when the *specific PID* is no longer active.
         for (exe_key, acc) in &self.accumulators {
-            // Find the PID from the previous poll's entries for this exe_path
             let prev_entry = self
                 .entries
                 .iter()
                 .find(|e| e.exe.to_lowercase() == *exe_key);
             let prev_pid = prev_entry.map(|e| e.pid);
 
-            // Only add dormant entry if this specific PID is NOT in the current snapshot
             let pid_still_active = prev_pid.is_some_and(|pid| stats_map.contains_key(&pid));
 
             if !pid_still_active {
@@ -853,7 +793,6 @@ impl NetworkEngine {
                     } else {
                         acc.original_exe_path.clone()
                     };
-                    // Preserve the last_seen from the previous entries (frozen at dormancy)
                     let prev_last_seen = prev_entry
                         .map(|e| e.last_seen.clone())
                         .unwrap_or_else(|| acc.last_seen.clone());
@@ -867,23 +806,70 @@ impl NetworkEngine {
                         speed: 0.0,
                         connections: 0,
                         last_seen: prev_last_seen,
-                        data_source: "io_counters".into(),
+                        data_source: "dormant".into(),
                     });
                 }
             }
         }
 
-        // 9. Sort by session data descending (highest consumers first)
+        // 8. Sort by session data descending (highest consumers first)
         new_entries.sort_by(|a, b| {
             b.session_data
                 .partial_cmp(&a.session_data)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 10. Detect data spikes before finalising the entries
+        // 9. Detect data spikes before finalising the entries
         self.detect_spikes(&new_entries);
 
+        // 10. Flush pending deltas to SQLite if the flush interval has elapsed.
+        self.flush_to_db();
+
         self.entries = new_entries;
+    }
+
+    /// Flush accumulated byte deltas to the SQLite database.
+    /// Called every poll cycle; only actually writes if the flush interval
+    /// (10 seconds) has elapsed and there are pending deltas.
+    pub(crate) fn flush_to_db(&mut self) {
+        let Some(ref db) = self.db_manager else {
+            return;
+        };
+
+        // Check if enough time has elapsed since the last flush
+        if self.last_flush_instant.elapsed().as_secs() < self.flush_interval_secs {
+            return;
+        }
+
+        // Drain pending deltas
+        if self.pending_deltas.is_empty() {
+            self.last_flush_instant = Instant::now();
+            return;
+        }
+
+        let deltas: Vec<_> = self.pending_deltas.drain().collect();
+        let mut batch = Vec::with_capacity(deltas.len());
+
+        for (app_path, delta) in deltas {
+            let app_name = display_name_for(&app_path);
+            batch.push((app_path, app_name, "unknown".to_string(), delta));
+        }
+
+        match db.lock() {
+            Ok(db) => match db.flush_batch(&batch) {
+                Ok(count) => {
+                    log::debug!("Flushed {} usage records to SQLite", count);
+                }
+                Err(e) => {
+                    log::warn!("Failed to flush to SQLite: {e}");
+                }
+            },
+            Err(e) => {
+                log::warn!("SQLite lock poisoned during flush: {e}");
+            }
+        }
+
+        self.last_flush_instant = Instant::now();
     }
 }
 
@@ -893,26 +879,80 @@ impl NetworkEngine {
 /// Orphaned sessions cause `ERROR_ALREADY_EXISTS` on next launch.
 impl Drop for NetworkEngine {
     fn drop(&mut self) {
+        // Flush any remaining pending deltas to SQLite before shutdown.
+        self.flush_to_db();
+
         #[cfg(target_os = "windows")]
-        crate::etw::stop();
+        {
+            self.wfp.stop_monitoring();
+            crate::etw::stop();
+        }
     }
 }
 
 // ──────────────────────────── background task ────────────────────────────────
 
-/// Spawn the background 2-second polling loop.
-/// Runs as a `spawn_blocking` thread so blocking Win32 calls don't stall Tokio.
-pub fn start_polling_task(engine: Arc<Mutex<NetworkEngine>>) {
+/// Tauri event name for real-time metrics updates.
+pub const EVENT_REALTIME_UPDATE: &str = "realtime-update";
+
+/// Real-time metrics payload emitted to the frontend every 1 second.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RealTimeMetric {
+    /// All process entries with their current speeds.
+    pub entries: Vec<ProcessEntry>,
+    /// Total interface throughput (bytes_received_per_sec, bytes_sent_per_sec).
+    pub total_throughput: (f64, f64),
+    /// ISO-8601 timestamp of this emission.
+    pub timestamp: String,
+}
+
+/// Spawn the background polling loop that emits Tauri events.
+///
+/// - Every 2 seconds: full poll (ETW snapshot, connection counts, etc.)
+/// - Every 1 second: emit RealTimeMetric to the frontend via Tauri events
+///
+/// This separation ensures the heavy polling work (Win32 API calls) happens
+/// every 2 seconds, while the lightweight event emission happens every second
+/// for a smoother UI experience.
+pub fn start_polling_task(engine: Arc<Mutex<NetworkEngine>>, app_handle: tauri::AppHandle) {
     std::thread::spawn(move || {
         log::info!("NetworkEngine polling task started");
+        let mut last_event_instant = Instant::now();
+        let event_interval = Duration::from_secs(1);
+        let poll_interval = Duration::from_secs(2);
+        let mut last_poll_instant = Instant::now();
+
         loop {
-            {
+
+            // 1. Full poll every 2 seconds (heavy: Win32 API calls)
+            if last_poll_instant.elapsed() >= poll_interval {
                 match engine.lock() {
                     Ok(mut eng) => eng.poll(),
                     Err(e) => log::error!("Engine mutex poisoned: {e}"),
                 }
+                last_poll_instant = Instant::now();
             }
-            std::thread::sleep(Duration::from_secs(2));
+
+            // 2. Emit real-time event every 1 second (lightweight: just clone + emit)
+            if last_event_instant.elapsed() >= event_interval {
+                if let Ok(eng) = engine.lock() {
+                    let metric = RealTimeMetric {
+                        entries: eng.get_entries(),
+                        total_throughput: eng.get_total_throughput(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+
+                    // Emit to all windows — non-fatal on error
+                    if let Err(e) = app_handle.emit(EVENT_REALTIME_UPDATE, &metric) {
+                        log::warn!("Failed to emit realtime-update event: {e}");
+                    }
+                }
+                last_event_instant = Instant::now();
+            }
+
+            // Sleep briefly to avoid busy-waiting
+            std::thread::sleep(Duration::from_millis(100));
         }
     });
 }

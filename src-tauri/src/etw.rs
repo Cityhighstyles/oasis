@@ -7,6 +7,12 @@
 //!      event containing the PID, byte count, addresses, and ports
 //!   4. We parse events and accumulate per-PID byte counts in real-time
 //!
+//! Protocol coverage:
+//!   - TCP send/recv (IPv4 opcodes 10, 11; IPv6 opcodes 26, 27)
+//!   - UDP send/recv (IPv4 opcodes 12, 13; IPv6 opcodes 28, 29)
+//!     This captures QUIC/HTTP3, DNS, multiplayer gaming, and other
+//!     UDP-based traffic that would otherwise be invisible.
+//!
 //! Unlike polling-based IP Helper API (every 2 seconds), ETW is truly
 //! **event-driven** — the kernel pushes events when actual network I/O occurs,
 //! giving Resource Monitor-grade accuracy with near-zero CPU overhead.
@@ -38,10 +44,17 @@ const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 = 0x0001;
 const TRACE_LEVEL_INFORMATION: u8 = 4;
 
 /// Event ID (Opcode) values from Microsoft-Windows-TCPIP provider
+// ── TCP opcodes ──────────────────────────────────────────────────────
 const TCPIP_SEND_IPV4: u8 = 10;
 const TCPIP_RECV_IPV4: u8 = 11;
 const TCPIP_SEND_IPV6: u8 = 26;
 const TCPIP_RECV_IPV6: u8 = 27;
+// ── UDP opcodes ──────────────────────────────────────────────────────
+// Captures QUIC/HTTP3, DNS, multiplayer gaming, and other UDP traffic.
+const UDPIP_SEND_IPV4: u8 = 12;
+const UDPIP_RECV_IPV4: u8 = 13;
+const UDPIP_SEND_IPV6: u8 = 28;
+const UDPIP_RECV_IPV6: u8 = 29;
 
 // ── Native struct definitions ─────────────────────────────────────────────
 
@@ -230,17 +243,21 @@ unsafe extern "system" fn event_record_callback(event: *mut EventRecord) {
     let pid = record.event_header.process_id;
     let opcode = record.event_header.event_descriptor.opcode;
 
-    // We only care about TCP/IP send and receive events
-    let is_send = opcode == TCPIP_SEND_IPV4 || opcode == TCPIP_SEND_IPV6;
-    let is_recv = opcode == TCPIP_RECV_IPV4 || opcode == TCPIP_RECV_IPV6;
+    // We care about TCP and UDP send/receive events
+    let is_tcp_send = opcode == TCPIP_SEND_IPV4 || opcode == TCPIP_SEND_IPV6;
+    let is_tcp_recv = opcode == TCPIP_RECV_IPV4 || opcode == TCPIP_RECV_IPV6;
+    let is_udp_send = opcode == UDPIP_SEND_IPV4 || opcode == UDPIP_SEND_IPV6;
+    let is_udp_recv = opcode == UDPIP_RECV_IPV4 || opcode == UDPIP_RECV_IPV6;
+    let is_send = is_tcp_send || is_udp_send;
+    let is_recv = is_tcp_recv || is_udp_recv;
 
     if !is_send && !is_recv {
         return;
     }
 
     // Extract byte count from the event payload.
-    // For TcpIp_TypeGroup1 events, the user data layout starts with:
-    //   PID (u32), Size (u32), ...
+    // For both TcpIp_TypeGroup1 and UdpIp_TypeGroup1 events, the user
+    // data layout starts with: PID (u32), Size (u32), ...
     // The PID in the event payload is the same as EventHeader.ProcessId.
     // Size is the number of bytes transferred.
     let bytes: u64 = if !record.user_data.is_null() && record.user_data_length >= 8 {

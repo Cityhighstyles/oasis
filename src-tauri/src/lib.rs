@@ -26,6 +26,7 @@ pub mod pdh;
 pub mod etw;
 
 pub mod carbon;
+pub mod db;
 pub mod engine;
 pub mod commands;
 pub mod rules;
@@ -52,6 +53,34 @@ pub fn run() {
     // ── Build the shared engine ──────────────────────────────────────────────
     let engine = Arc::new(Mutex::new(NetworkEngine::new()));
 
+    // ── Open the SQLite database for persistent historical data ──────────────
+    let db_manager = match crate::db::DatabaseManager::open_default() {
+        Ok(db) => {
+            log::info!("SQLite database opened successfully");
+            Some(Arc::new(Mutex::new(db)))
+        }
+        Err(e) => {
+            log::warn!("SQLite database failed to open (non-fatal): {e}");
+            None
+        }
+    };
+
+    // Attach the database manager to the engine
+    if let Some(ref db) = db_manager {
+        // Cleanup records older than 90 days on startup
+        if let Ok(db_lock) = db.lock() {
+            match db_lock.cleanup_old_records(90) {
+                Ok(n) if n > 0 => log::info!("Cleaned up {} old usage records", n),
+                Ok(_) => {},
+                Err(e) => log::warn!("Failed to cleanup old records: {e}"),
+            }
+        }
+
+        if let Ok(mut eng) = engine.lock() {
+            eng.set_db_manager(Arc::clone(db));
+        }
+    }
+
     // ── Build the sandbox engine ────────────────────────────────────────────
     let sandbox_engine = Arc::new(Mutex::new(SandboxEngine::new()));
 
@@ -63,7 +92,7 @@ pub fn run() {
     }
 
     // ── Start the background polling task ───────────────────────────────────
-    engine::start_polling_task(Arc::clone(&engine));
+    // Note: polling task is started inside setup() so we have access to the AppHandle.
 
     // ── Build Tauri app ──────────────────────────────────────────────────────
     tauri::Builder::default()
@@ -167,6 +196,12 @@ pub fn run() {
             // The frontend calls start_sandbox_scanner / stop_sandbox_scanner
             // commands to control when the background process scanner runs.
 
+            // ── Start the background polling task with AppHandle ────────────
+            // Pass the AppHandle so the polling loop can emit Tauri events
+            // (realtime-update) to the frontend every 1 second.
+            let app_handle = app.handle().clone();
+            engine::start_polling_task(Arc::clone(&engine), app_handle);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -200,6 +235,11 @@ pub fn run() {
             commands::get_spike_settings,
             commands::set_spike_threshold,
             commands::set_spike_min_speed,
+            // ── History commands ──────────────────────────────────────
+            commands::get_app_history_totals,
+            commands::get_all_app_history_totals,
+            commands::get_app_hourly_usage,
+            commands::flush_db_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
