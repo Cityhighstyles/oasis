@@ -32,13 +32,8 @@ use crate::pdh::InterfaceThroughput;
 #[cfg(target_os = "windows")]
 use crate::etw;
 
-#[cfg(not(target_os = "windows"))]
-pub struct InterfaceThroughput;
-
 #[cfg(target_os = "windows")]
 use crate::iphelper::{self, ProcessNetStats};
-#[cfg(not(target_os = "windows"))]
-use stub::ProcessNetStats;
 
 // winrt-toast-reborn is a [target.'cfg(windows)'.dependencies] in Cargo.toml,
 // so it must be gated behind cfg(windows) to avoid non-Windows compile errors.
@@ -94,6 +89,7 @@ mod stub {
         use std::collections::HashMap;
         use super::ProcessNetStats;
         pub fn collect_udp_counts(_: &mut HashMap<u32, ProcessNetStats>) {}
+        pub fn get_process_io_other_bytes(_pid: u32) -> Option<u64> { None }
     }
 }
 
@@ -214,6 +210,8 @@ pub struct NetworkEngine {
     last_poll_instant: Instant,
     /// Cumulative bytes per PID (total since first seen, used for session_data display).
     per_pid_cumulative: HashMap<u32, u64>,
+    /// Initial IO `OtherTransferCount` for each PID when first seen by the engine.
+    per_pid_initial_io: HashMap<u32, u64>,
     /// Set of PIDs that have been suspended by the user.
     #[cfg(target_os = "windows")]
     pub suspended_pids: std::collections::HashSet<u32>,
@@ -255,6 +253,7 @@ impl NetworkEngine {
             entries: Vec::new(),
             accumulators: HashMap::new(),
             per_pid_cumulative: HashMap::new(),
+            per_pid_initial_io: HashMap::new(),
             last_poll_instant: Instant::now(),
             #[cfg(target_os = "windows")]
             suspended_pids: std::collections::HashSet::new(),
@@ -709,14 +708,43 @@ impl NetworkEngine {
             acc.original_exe_path = net_stats.exe_path.clone();
             acc.last_seen = now.clone();
 
-            // Session data from per-PID cumulative bytes
-            let pid_cumulative = self.per_pid_cumulative.get(pid).copied().unwrap_or(0);
-            let session_mb = round2(bytes_to_mb(pid_cumulative));
+            // Query GetProcessIoCounters (OtherTransferCount) as the definitive source of cumulative data consumption.
+            // If unavailable, fall back to any existing cumulative bytes from ETW/polling.
+            let current_io = iphelper::get_process_io_other_bytes(*pid);
+            let session_bytes = if let Some(current_io_val) = current_io {
+                // If it is the first time we see this process PID, set the initial IO baseline.
+                let initial_io_val = *self.per_pid_initial_io.entry(*pid).or_insert(current_io_val);
+                current_io_val.saturating_sub(initial_io_val)
+            } else {
+                // Fallback to cumulative ETW bytes
+                self.per_pid_cumulative.get(pid).copied().unwrap_or(0)
+            };
+
+            // Cumulative bytes for session data
+            let prev_cumulative = self.per_pid_cumulative.get(pid).copied().unwrap_or(0);
+            // Dynamic IO delta for this tick (either from OtherTransferCount delta or falling back to bytes_in)
+            let delta_io_bytes = if current_io.is_some() {
+                session_bytes.saturating_sub(prev_cumulative)
+            } else {
+                net_stats.bytes_in
+            };
+
+            // Update cumulative bytes tracker
+            self.per_pid_cumulative.insert(*pid, session_bytes);
+            let session_mb = round2(bytes_to_mb(session_bytes));
 
             // Dynamic speed: bytes_delta / elapsed_secs (replaces fixed / 2.0)
-            let speed_in = net_stats.bytes_in as f64 / elapsed;
+            let mut speed_in = net_stats.bytes_in as f64 / elapsed;
             let speed_out = net_stats.bytes_out as f64 / elapsed;
-            let speed = speed_in + speed_out;
+            let mut speed = speed_in + speed_out;
+
+            // Fallback for speed: if ETW is inactive/fails but we have a non-zero delta_io_bytes,
+            // compute the combined real-time speed from the IO delta.
+            if speed_in == 0.0 && speed_out == 0.0 && delta_io_bytes > 0 {
+                speed = delta_io_bytes as f64 / elapsed;
+                // Distribute fallback speed into speed_in for a cleaner UI (represented as download bytes)
+                speed_in = speed;
+            }
 
             let status = if is_blocked {
                 "blocked"
@@ -726,8 +754,8 @@ impl NetworkEngine {
                 "monitoring"
             };
 
-            // Track carbon: record the bytes transferred this tick
-            let delta_bytes = net_stats.bytes_in;
+            // Track carbon: record the bytes transferred this tick (using delta_io_bytes so we capture all network I/O!)
+            let delta_bytes = delta_io_bytes;
             self.carbon_tracker.record_bytes(
                 &net_stats.exe_path,
                 &display_name,
@@ -743,21 +771,27 @@ impl NetworkEngine {
                 }
             }
 
-            // Update cumulative bytes for session data
-            *self.per_pid_cumulative.entry(*pid).or_insert(0) += delta_bytes;
-
             // Accumulate pending deltas for SQLite flush
             if delta_bytes > 0 || net_stats.bytes_out > 0 {
                 let delta = self.pending_deltas.entry(exe_key.clone()).or_default();
-                delta.bytes_received += delta_bytes;
-                delta.bytes_sent += net_stats.bytes_out;
+                if net_stats.bytes_in > 0 || net_stats.bytes_out > 0 {
+                    delta.bytes_received += net_stats.bytes_in;
+                    delta.bytes_sent += net_stats.bytes_out;
+                } else {
+                    delta.bytes_received += delta_bytes;
+                }
             }
 
-            // Data source is always ETW now
-            #[cfg(target_os = "windows")]
-            let source = "etw".to_string();
-            #[cfg(not(target_os = "windows"))]
-            let source = "unavailable".to_string();
+            // Set data source name based on the actual telemetry used for speed
+            let source = if current_io.is_some() {
+                if net_stats.bytes_in > 0 || net_stats.bytes_out > 0 {
+                    "blended".to_string()
+                } else {
+                    "io_counters".to_string()
+                }
+            } else {
+                "unavailable".to_string()
+            };
 
             new_entries.push(ProcessEntry {
                 pid: *pid,
@@ -777,6 +811,9 @@ impl NetworkEngine {
                 data_source: source,
             });
         }
+
+        // Cleanup initial IO baseline for inactive PIDs to handle PID recycling correctly.
+        self.per_pid_initial_io.retain(|pid, _| stats_map.contains_key(pid));
 
         // 7. Preserve dormant processes — only when the *specific PID* is no longer active.
         for (exe_key, acc) in &self.accumulators {
