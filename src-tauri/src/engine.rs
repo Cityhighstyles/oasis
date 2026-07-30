@@ -647,8 +647,6 @@ impl NetworkEngine {
             let tracked = etw_snapshot.tracked_events;
             let pid_count = etw_snapshot.per_pid.len();
 
-            log::warn!("ETW_DEBUG snapshot: tracked_events={}, pid_count={}", tracked, pid_count);
-
             for (pid, (etw_recv, etw_send)) in etw_snapshot.per_pid {
                 let bytes_in = etw_recv;
                 let bytes_out = etw_send;
@@ -729,9 +727,7 @@ impl NetworkEngine {
             };
 
             // Track carbon: record the bytes transferred this tick
-            // Include BOTH inbound and outbound bytes for total session data
-            // (matching GlassWire's behavior of showing total MB consumed).
-            let delta_bytes = net_stats.bytes_in + net_stats.bytes_out;
+            let delta_bytes = net_stats.bytes_in;
             self.carbon_tracker.record_bytes(
                 &net_stats.exe_path,
                 &display_name,
@@ -747,23 +743,13 @@ impl NetworkEngine {
                 }
             }
 
-            // Update cumulative bytes for session data (both in + out)
+            // Update cumulative bytes for session data
             *self.per_pid_cumulative.entry(*pid).or_insert(0) += delta_bytes;
 
-            // Debug: log first few PIDs to verify accumulation
-            let cumulative = *self.per_pid_cumulative.get(pid).unwrap_or(&0);
-            if new_entries.len() < 3 {
-                log::warn!(
-                    "ETW_DEBUG accumulate: PID={}, delta_bytes={}, cumulative={}, session_mb={}, bytes_in={}, bytes_out={}",
-                    pid, delta_bytes, cumulative, session_mb, net_stats.bytes_in, net_stats.bytes_out
-                );
-            }
-
             // Accumulate pending deltas for SQLite flush
-            // Use individual in/out values for accurate database records
-            if net_stats.bytes_in > 0 || net_stats.bytes_out > 0 {
+            if delta_bytes > 0 || net_stats.bytes_out > 0 {
                 let delta = self.pending_deltas.entry(exe_key.clone()).or_default();
-                delta.bytes_received += net_stats.bytes_in;
+                delta.bytes_received += delta_bytes;
                 delta.bytes_sent += net_stats.bytes_out;
             }
 
