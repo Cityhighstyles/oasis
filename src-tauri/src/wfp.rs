@@ -71,41 +71,6 @@ pub struct BlockedAppFilters {
     pub filter_id_v6: u64,
 }
 
-// ── Network event subscription types ────────────────────────────────────
-//
-// FWPM_NET_EVENT0 and FWPM_NET_EVENT_SUBSCRIPTION0 are opaque Windows SDK
-// structs. We use *const c_void and extract fields at known offsets to avoid
-// fragile manual struct definitions that depend on platform alignment.
-//
-// FWPM_NET_EVENT0 layout (x64, verified from SDK headers):
-//   Offset  0: type         (u32)  — FWPM_NET_EVENT_TYPE enum
-//   Offset  4: padding      (4 bytes for alignment)
-//   Offset  8: header       (*mut FWPM_NET_EVENT_HEADER0) — pointer to header
-//   Offset 16: flags        (u32)  — FWPM_NET_EVENT_FLAG
-//   Offset 20: padding      (4 bytes)
-//   Offset 24: union        (8 bytes) — event-specific data
-//   Total: 32 bytes
-//
-// FWPM_NET_EVENT_HEADER0 layout (x64, verified from SDK headers):
-//   Offset  0: timestamp     (i64)
-//   Offset  8: flags         (u32)
-//   Offset 12: ipVersion     (u32)
-//   Offset 16: ipProtocol    (u32)
-//   Offset 20: padding       (4 bytes)
-//   Offset 24: localAddrV4   (u32) or localAddrV6 ([u8;16])
-//   Offset 28: remoteAddrV4  (u32) or padding
-//   Offset 40: localPort     (u16)
-//   Offset 42: remotePort    (u16)
-//   Offset 44: padding       (4 bytes)
-//   Offset 48: scopeId       (u32)
-//   Offset 52: padding       (4 bytes)
-//   Offset 56: appId         (FWPM_BYTE_BLOB*)
-//   Offset 64: userId        (FWPM_BYTE_BLOB*)
-//   Offset 72: processId     (u32)  ← THIS IS WHAT WE NEED
-//   ... (more fields follow)
-//
-// We read processId from offset 72 of the header struct.
-
 /// Callback type for FwpmNetEventSubscribe0 (raw nullable function pointer).
 /// The Option wrapper in Rust is ABI-compatible with a nullable C function pointer.
 type FwpmNetEventCallback = Option<
@@ -115,11 +80,9 @@ type FwpmNetEventCallback = Option<
     ),
 >;
 
-/// FWPM_NET_EVENT0 field offsets (x64 only).
-const NET_EVENT_HEADER_PTR_OFFSET: usize = 8;
-
-/// FWPM_NET_EVENT_HEADER0 field offsets (x64 only).
-const HEADER_PROCESS_ID_OFFSET: usize = 72;
+/// processId offset in FWPM_NET_EVENT_HEADER0 (x64, verified from SDK fwpmu.h).
+/// The header is embedded inline in FWPM_NET_EVENT0 at offset 0.
+const HEADER_PROCESS_ID_OFFSET: usize = 88;
 
 // ── Network event monitoring state ─────────────────────────────────────
 //
@@ -130,7 +93,7 @@ const HEADER_PROCESS_ID_OFFSET: usize = 72;
 /// Shared state for WFP network event monitoring.
 struct MonitorState {
     /// Set of PIDs that have been observed in network events.
-    /// (pid, 0) tuples — byte counts are tracked by ETW, not WFP.
+    /// Byte counts are tracked by ETW, not WFP.
     active_pids: std::collections::HashSet<u32>,
     /// Total events received from the kernel.
     total_events: u64,
@@ -485,49 +448,50 @@ pub fn get_app_id_bytes(win32_path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// WFP network event callback — called by the kernel for each network event.
-/// Extracts PID from the event header at verified x64 offsets.
 ///
-/// This callback runs on a kernel dispatch thread, so it must be fast and
-/// lock-free (Mutex lock is acceptable but should be held briefly).
+/// Extracts PID from the event header using offsets verified against
+/// the Windows SDK headers (fwpmu.h). Uses `read_unaligned` for safety
+/// because the kernel may deliver the struct at any alignment.
 ///
-/// **x64-only**: The header struct offsets used here are specific to x64.
-/// This callback is registered via FwpmNetEventSubscribe0 which is only
-/// available on Windows, and this app only targets x64 Windows.
+/// FWPM_NET_EVENT0 (x64, 120 bytes):
+///   [0..104]   header  (FWPM_NET_EVENT_HEADER0, embedded inline)
+///   [104..108] type    (FWP_NET_EVENT_TYPE enum, u32)
+///   [108..112] padding
+///   [112..120] union   (pointer to event-specific data)
 ///
-/// FWPM_NET_EVENT0 layout (x64):
-///   [0..4]   type (u32)
-///   [4..8]   padding
-///   [8..16]  header → *mut FWPM_NET_EVENT_HEADER0
-///   [16..20] flags (u32)
-///
-/// FWPM_NET_EVENT_HEADER0 layout (x64):
-///   [0..8]   timestamp (i64)
-///   [8..12]  flags (u32)
-///   ...
-///   [72..76] processId (u32)
+/// FWPM_NET_EVENT_HEADER0 (x64, 104 bytes):
+///   [0..8]     timeStamp  (wchar_t*)
+///   [8..12]    flags      (u32)
+///   [12..16]   ipVersion  (FWP_IP_VERSION)
+///   [16]       ipProtocol (u8)
+///   [20..36]   localAddr  (FWP_BYTE_ARRAY16)
+///   [36..38]   localPort  (u16)
+///   [40..56]   remoteAddr (FWP_BYTE_ARRAY16)
+///   [56..58]   remotePort (u16)
+///   [60..64]   size       (u32)
+///   [64..68]   appIdSize  (u32)
+///   [72..80]   appId      (BYTE*)
+///   [80..88]   userId     (PSID)
+///   [88..92]   processId  (u32) ← THIS IS WHAT WE NEED
+///   [96..104]  creatorId  (wchar_t*)
 unsafe extern "system" fn net_event_callback(
     _context: *const c_void,
     event: *const c_void,
 ) {
-    // This callback is only called on Windows (registered via FwpmNetEventSubscribe0).
-    // The offset-based field extraction is x64-only. If 32-bit Windows support
-    // is ever needed, the offsets in NET_EVENT_HEADER_PTR_OFFSET and
-    // HEADER_PROCESS_ID_OFFSET must be recalculated for x86.
-    #[cfg(not(target_arch = "x86_64"))]
-    return; // Skip on non-x64 architectures — offsets are x64-specific
-
     if event.is_null() {
         return;
     }
 
-    // Read the header pointer from FWPM_NET_EVENT0 at offset 8
-    let header_ptr = *((event as *const u8).add(NET_EVENT_HEADER_PTR_OFFSET) as *const *const u8);
-    if header_ptr.is_null() {
-        return;
-    }
+    // FWPM_NET_EVENT0: header is embedded inline at offset 0 (NOT a pointer).
+    // The header starts at the same address as the event struct itself.
+    let header_base = event as *const u8;
 
-    // Read processId from FWPM_NET_EVENT_HEADER0 at offset 72
-    let pid = *(header_ptr.add(HEADER_PROCESS_ID_OFFSET) as *const u32);
+    // Read processId from FWPM_NET_EVENT_HEADER0 at offset 88.
+    // Use read_unaligned because the kernel may deliver the struct
+    // at any alignment — aligned reads on unaligned addresses cause
+    // STATUS_STACK_BUFFER_OVERRUN on x64.
+    let pid_ptr = header_base.add(HEADER_PROCESS_ID_OFFSET) as *const u32;
+    let pid = ptr::read_unaligned(pid_ptr);
 
     // PID 0 or 4 are system/kernel — skip them
     if pid <= 4 {

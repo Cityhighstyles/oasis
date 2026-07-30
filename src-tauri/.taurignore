@@ -1,0 +1,5 @@
+# SQLite database files (runtime data — changes trigger infinite rebuild loops)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal

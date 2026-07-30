@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react"
 import { toast } from "sonner"
 import { invoke } from "@tauri-apps/api/core"
+import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart"
 
 export type ProcessStatus = "blocked" | "active" | "monitoring"
@@ -12,6 +13,10 @@ export type ProcessEntry = {
   status: ProcessStatus
   sessionData: number
   speed: number
+  /** Real-time download speed in bytes/sec (inbound traffic). */
+  speedIn: number
+  /** Real-time upload speed in bytes/sec (outbound traffic). */
+  speedOut: number
   connections: number
   lastSeen: string
   /** "etw" | "estats" | "io_counters" | "blended" */
@@ -350,7 +355,7 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
 
   const refreshAutostartStatus = useCallback(async () => {
     try {
-      const enabled = await isAutostartEnabled()
+      const enabled = await isAutostartEnabled
       setIsAutostartEnabled(enabled)
     } catch (err) {
       console.error("Failed to check autostart status:", err)
@@ -1250,6 +1255,37 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     lastSpikeCountRef.current = spikeEvents.length
   }, [spikeEvents])
 
+  // ── Real-time Tauri event listener ──────────────────────────────────────
+  // Listens for 'realtime-update' events emitted every 1s by the backend
+  // polling thread, replacing the need to poll get_live_processes via IPC.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null
+
+    async function setupListener() {
+      unlisten = await listen<{
+        entries: ProcessEntry[]
+        totalThroughput: [number, number]
+        timestamp: string
+      }>("realtime-update", (event) => {
+        const { entries, totalThroughput } = event.payload
+        setProcesses(entries)
+        const totalSessionData = entries.reduce((sum, p) => sum + p.sessionData, 0)
+        setDataBudgetUsed(Math.round(totalSessionData))
+        setTotalThroughput({
+          bytesReceivedPerSec: totalThroughput[0],
+          bytesSentPerSec: totalThroughput[1],
+        })
+      })
+    }
+
+    setupListener()
+
+    return () => {
+      if (unlisten) unlisten()
+    }
+  }, [])
+
+  // Fallback: initial data load + periodic refresh for non-process data
   useEffect(() => {
     refreshWfpStatus()
     refreshProcesses()
@@ -1261,9 +1297,11 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
     refreshAutostartStatus()
     refreshTotalThroughput()
 
-    const interval = setInterval(() => {
+    // Process polling is now handled by the realtime-update event listener above.
+    // Keep a lighter fallback poll every 5s in case events are missed.
+    const fallbackInterval = setInterval(() => {
       refreshProcesses()
-    }, 2000)
+    }, 5000)
 
     const carbonInterval = setInterval(() => {
       refreshCarbonStats()
@@ -1273,17 +1311,12 @@ export function ShieldProvider({ children }: { children: React.ReactNode }) {
       refreshSpikeEvents()
     }, 5000)
 
-    const throughputInterval = setInterval(() => {
-      refreshTotalThroughput()
-    }, 2000)
-
     return () => {
-      clearInterval(interval)
+      clearInterval(fallbackInterval)
       clearInterval(carbonInterval)
       clearInterval(spikeInterval)
-      clearInterval(throughputInterval)
     }
-  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids, refreshRules, refreshCarbonStats, refreshSpikeEvents, refreshSpikeSettings, refreshAutostartStatus])
+  }, [refreshWfpStatus, refreshProcesses, refreshSuspendedPids, refreshRules, refreshCarbonStats, refreshSpikeEvents, refreshSpikeSettings, refreshAutostartStatus, refreshTotalThroughput])
 
   const blockedCount = processes.filter((p) => p.status === "blocked").length
   const blockedApps = processes.filter((p) => p.status === "blocked")

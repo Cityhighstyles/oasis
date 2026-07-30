@@ -75,6 +75,8 @@ type ProcessGroup = {
   pidCount: number
   status: ProcessStatus
   lastSeen: string
+  totalSpeedIn: number
+  totalSpeedOut: number
 }
 
 function groupProcesses(entries: ProcessEntry[]): ProcessGroup[] {
@@ -88,6 +90,8 @@ function groupProcesses(entries: ProcessEntry[]): ProcessGroup[] {
       existing.processes.push(proc)
       existing.totalSessionData += proc.sessionData
       existing.totalConnections += proc.connections
+      existing.totalSpeedIn += proc.speedIn
+      existing.totalSpeedOut += proc.speedOut
       existing.pidCount++
       // Status priority: blocked > active > monitoring
       if (proc.status === "blocked") {
@@ -106,6 +110,8 @@ function groupProcesses(entries: ProcessEntry[]): ProcessGroup[] {
         processes: [proc],
         totalSessionData: proc.sessionData,
         totalConnections: proc.connections,
+        totalSpeedIn: proc.speedIn,
+        totalSpeedOut: proc.speedOut,
         pidCount: 1,
         status: proc.status,
         lastSeen: proc.lastSeen,
@@ -334,14 +340,27 @@ function PidSubRow({ proc, isOperating, wfpAvailable, isSuspended, onSuspend, on
         >
           {proc.sessionData > 0 ? `${proc.sessionData} MB` : "—"}
         </span>
-        {proc.speed > 0 && (
-          <span className="flex items-center gap-1 mt-0.5">
-            <span className={cn("text-[9px] tabular-nums font-medium leading-tight", TREND_TEXT[speedTrend])}>
-              ↑ {formatSpeed(proc.speed)}
-            </span>
-            <DataSourceBadge source={proc.dataSource} />
-          </span>
+        {(proc.speedIn > 0 || proc.speedOut > 0) && (
+          <div className="flex flex-col gap-0.5 mt-0.5">
+            {proc.speedIn > 0 && (
+              <span className="flex items-center gap-1">
+                <span className="text-[8px] text-neon-cyan/70">▼</span>
+                <span className={cn("text-[9px] tabular-nums font-medium leading-tight", TREND_TEXT[speedTrend])}>
+                  {formatSpeed(proc.speedIn)}
+                </span>
+              </span>
+            )}
+            {proc.speedOut > 0 && (
+              <span className="flex items-center gap-1">
+                <span className="text-[8px] text-amber-400/70">▲</span>
+                <span className="text-[9px] tabular-nums font-medium leading-tight text-amber-400/80">
+                  {formatSpeed(proc.speedOut)}
+                </span>
+              </span>
+            )}
+          </div>
         )}
+        {(proc.speedIn > 0 || proc.speedOut > 0) && <DataSourceBadge source={proc.dataSource} className="mt-0.5" />}
       </div>
 
       {/* Last active */}
@@ -975,40 +994,49 @@ export function LiveMonitor() {
                       {/* Status */}
                       <div className="self-center">
                         <StatusBadge status={group.status} />
-                      </div>
-
-                      {/* Session data usage (aggregate) + speed */}
-                      <div className="self-center">
-                        <span
-                          className={cn(
-                            "tabular-nums font-medium",
-                            group.totalSessionData > 0
-                              ? "text-foreground"
-                              : "text-muted-foreground/40"
-                          )}
-                        >
-                          {group.totalSessionData > 0
-                            ? `${group.totalSessionData} MB`
-                            : "—"}
-                        </span>
-                        {totalSpeed > 0 && (
-                          <div className="flex items-center gap-1 mt-0.5">
-                            <span className={cn("text-[9px] tabular-nums font-medium", TREND_TEXT[trend])}>
-                              ↑ {formatSpeed(totalSpeed)}
-                            </span>
-                            <MicroSparkline samples={history} maxVal={maxSpeed} trend={trend} />
-                            {/* Show data source badge — per-PID badges shown in expanded rows */}
-                            {(() => {
-                              const sources = new Set(group.processes.map(p => p.dataSource))
-                              if (sources.size === 1) {
-                                return <DataSourceBadge source={group.processes[0].dataSource} />
-                              }
-                              // Don't show a badge when sources differ — per-PID badges in sub-rows are accurate
-                              return null
-                            })()}
-                          </div>
-                        )}
-                      </div>
+                      </div>      {/* Session data usage (aggregate) + speed */}
+      <div className="self-center">
+        <span
+          className={cn(
+            "tabular-nums font-medium",
+            group.totalSessionData > 0
+              ? "text-foreground"
+              : "text-muted-foreground/40"
+          )}
+        >
+          {group.totalSessionData > 0
+            ? `${group.totalSessionData} MB`
+            : "—"}
+        </span>
+        {totalSpeed > 0 && (
+          <div className="flex flex-col gap-0.5 mt-0.5">
+            <div className="flex items-center gap-1">
+              <span className="text-[8px] text-neon-cyan/70">▼</span>
+              <span className={cn("text-[9px] tabular-nums font-medium", TREND_TEXT[trend])}>
+                {formatSpeed(group.totalSpeedIn)}
+              </span>
+              <MicroSparkline samples={history} maxVal={maxSpeed} trend={trend} />
+            </div>
+            {group.totalSpeedOut > 0 && (
+              <div className="flex items-center gap-1">
+                <span className="text-[8px] text-amber-400/70">▲</span>
+                <span className="text-[9px] tabular-nums font-medium text-amber-400/80">
+                  {formatSpeed(group.totalSpeedOut)}
+                </span>
+              </div>
+            )}
+            {/* Show data source badge — per-PID badges shown in expanded rows */}
+            {(() => {
+              const sources = new Set(group.processes.map(p => p.dataSource))
+              if (sources.size === 1) {
+                return <DataSourceBadge source={group.processes[0].dataSource} />
+              }
+              // Don't show a badge when sources differ — per-PID badges in sub-rows are accurate
+              return null
+            })()}
+          </div>
+        )}
+      </div>
 
                       {/* Last active */}
                       <span
