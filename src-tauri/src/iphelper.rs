@@ -177,6 +177,24 @@ pub fn resolve_process_path(pid: u32) -> Option<String> {
     }
 }
 
+/// Query the IO counters for a given PID and return the `OtherTransferCount`.
+pub fn get_process_io_other_bytes(pid: u32) -> Option<u64> {
+    unsafe {
+        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut io_counters = std::mem::zeroed::<windows_sys::Win32::System::Threading::IO_COUNTERS>();
+        let ok = windows_sys::Win32::System::Threading::GetProcessIoCounters(handle, &mut io_counters);
+        CloseHandle(handle);
+        if ok != 0 {
+            Some(io_counters.OtherTransferCount)
+        } else {
+            None
+        }
+    }
+}
+
 // ──────────────────────────── internal helpers ───────────────────────────────
 
 /// GetExtendedTcpTable with the double-buffer pattern.
