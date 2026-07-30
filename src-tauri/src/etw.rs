@@ -130,19 +130,27 @@ struct EventHeader {
     process_id: u32,
     timestamp: i64,
     provider_id: [u8; 16],
-    event_descriptor: EventDescriptor,
-} // size = 48 bytes
+    event_descriptor: EventDescriptor, // 16 bytes (u16+u8+u8+u8+u8+u16+u64)
+} // size = 56 bytes on x64
 
 #[repr(C)]
 struct EventRecord {
-    event_header: EventHeader,  // 0-47
-    buffer_context: [u8; 24],   // 48-71
-    extended_data_count: u16,   // 72-73
-    user_data_length: u16,      // 74-75
-    extended_data: *mut c_void, // 76-83
-    user_data: *mut c_void,     // 84-91
-    user_context: *mut c_void,  // 92-99
-} // size = 100 bytes
+    event_header: EventHeader,  // 0-55 (56 bytes)
+    buffer_context: [u8; 8],   // 56-63 (8 bytes: ETW_BUFFER_CONTEXT = union(4) + LoggerId(4))
+    extended_data_count: u16,   // 64-65
+    user_data_length: u16,      // 66-67
+    // 4 bytes padding for 8-byte pointer alignment
+    extended_data: *mut c_void, // 72-79
+    user_data: *mut c_void,     // 80-87
+    user_context: *mut c_void,  // 88-95
+} // size = 96 bytes on x64
+
+// Compile-time assertion: verify struct matches Windows SDK EVENT_RECORD size.
+// If this fails, the struct layout is wrong and user_data will be at the wrong offset.
+const _: () = assert!(
+    std::mem::size_of::<EventRecord>() == 96,
+    "EventRecord must be exactly 96 bytes on x64 to match Windows SDK EVENT_RECORD"
+);
 
 /// EVENT_TRACE_LOGFILEW — manually defined with exact x64 layout.
 #[repr(C)]
@@ -284,6 +292,15 @@ unsafe extern "system" fn event_record_callback(event: *mut EventRecord) {
                 entry.0 = entry.0.saturating_add(bytes);
             } else {
                 entry.1 = entry.1.saturating_add(bytes);
+            }
+
+            // Debug: log first few events to verify byte extraction
+            if data.tracked_events <= 5 {
+                log::warn!(
+                    "ETW_DEBUG event #{}: PID={}, opcode={}, bytes={}, recv={}, total_per_pid={}",
+                    data.tracked_events, pid, opcode, bytes, is_recv,
+                    entry.0 + entry.1
+                );
             }
         }
     }
